@@ -1,0 +1,94 @@
+# A股量化因子自动演化配置
+
+# Tushare 配置 —— 从环境变量读取，或直接填写
+tushare_token: "${TUSHARE_TOKEN}"
+
+# 数据配置
+data_start_date: "20210101"
+data_end_date: "20250101"
+max_stocks: 300               # 沪深300全部成分股
+forward_period: 5              # 未来5日收益
+train_end_date: "20231231"     # 训练集截止日（2024年为验证集）
+
+# 语言设置
+language: python
+
+# 最大代码长度
+max_code_length: 4000
+
+# LLM 配置 (DeepSeek)
+llm:
+  models:
+    - name: "deepseek-v4-flash"
+      weight: 0.7
+      api_key: "${LLM_API_KEY}"
+      api_base: "${LLM_API_BASE}"
+    - name: "deepseek-v4-pro"
+      weight: 0.3
+      api_key: "${LLM_API_KEY}"
+      api_base: "${LLM_API_BASE}"
+  temperature: 0.8
+  max_tokens: 4096
+  retries: 3
+  timeout: 600
+
+# 数据库配置 (MAP-Elites + 岛屿模型)
+database:
+  population_size: 100          # 总种群大小
+  num_islands: 8                # 5个岛屿并行进化
+  migration_interval: 30        # 每30代迁移一次
+  exploration_ratio: 0.3        # 探索比例（随机采样）
+  exploitation_ratio: 0.4       # 开发比例（从最优附近采样）
+
+  # MAP-Elites 特征维度 - 4维因子多样性空间
+  # 评估器返回的原始连续值，框架自动分箱
+  feature_dimensions:
+    - "abs_ic_mean"             # |IC均值| - 预测能力
+    - "ic_ir"                   # |IC信息比| - 稳定性
+    - "ic_stability"            # IC胜率 - 方向一致性
+    - "factor_turnover"         # 因子换手率 - 交易成本
+  feature_bins: 5               # 每个维度5个分箱
+
+# 评估器配置
+evaluator:
+  timeout: 300                  # 单次评估超时（秒）
+  parallel_evaluations: 2       # 并行评估数
+  cascade_evaluation: false     # 使用直接评估模式（非级联）
+
+# 提示配置 - 使用自定义模板
+prompt:
+  num_top_programs: 3
+  num_diverse_programs: 2
+  include_artifacts: false
+  template_dir: "./prompts"
+  system_message: "system_message"
+
+# 进化配置
+diff_based_evolution: false
+
+# 检查点配置
+checkpoint_interval: 25
+
+# ═══ 知识库配置 ═══
+# 动态知识检索：从知识库中检索与当前因子问题相似的改进经验，注入LLM prompt
+# 知识回写：演化中显著提升的改进经验自动总结并写入知识库，形成闭环
+knowledge_base:
+  enabled: true                     # 是否启用知识库
+  module_dir: "./knowledge_base"    # 知识库模块目录
+  db_path: "./knowledge_base/kb_store.db"  # SQLite数据库路径
+  seed_file: "./knowledge_base/seed_knowledge.json"  # 初始种子知识
+
+  # 检索配置
+  retrieval_top_k: 5                # 每次检索返回的知识条目数
+  rule_filter_min_candidates: 10    # 规则过滤最小候选数
+
+  # 回写配置
+  writeback_threshold: 0.15         # combined_score提升超过15%才回写
+  use_llm_summary: true             # 使用轻量LLM总结改进经验
+
+  # Embedding配置（用于向量相似度检索）
+  # 优先使用本地 embedding server，不可用时 fallback 到 OpenAI 兼容 API
+  embedding_local_url: "${EMBEDDING_LOCAL_URL}"  # 本地向量服务，如 http://localhost:8190/llm_service/embedding
+  embedding_model: "local-bge"      # 本地服务标识（维度自动检测）
+  embedding_dim: 2048               # 嵌入向量维度（本地服务会自动检测并更新）
+  # embedding_api_key 和 embedding_base_url 仅在本地服务不可用时使用

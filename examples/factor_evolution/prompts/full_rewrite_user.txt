@@ -1,0 +1,82 @@
+## 当前因子代码
+
+```python
+{current_program}
+```
+
+## 评估结果概览
+
+| 指标 | 当前值 | 目标值 | 状态 |
+|------|--------|--------|------|
+| train_rank_ic_mean | {train_ic_current} | >0.08 | {train_ic_status} |
+| train_rank_ic_ir | {train_ir_current} | >0.5 | {train_ir_status} |
+| val_rank_ic_mean | {val_ic_current} | >0.03 | {val_ic_status} |
+| val_rank_ic_ir | {val_ir_current} | >0.3 | {val_ir_status} |
+| 综合评分 | {fitness_score} | 1.0 | {score_status} |
+
+{ic_trend_table}
+
+## 诊断结果（按优先级排序）
+
+{diagnostics_prio}
+
+## 具体参数调整建议
+
+{parameter_suggestions}
+
+## 知识库参考案例（与当前问题相似的改进经验）
+
+{knowledge_base_context}
+
+## 优秀因子示例与演化历史
+
+{evolution_history}
+
+## 改进指南
+
+### 核心目标
+- **正IC > 0.08**：截面 Rank IC 均值
+- **IC_IR > 0.5**：IC 均值 / IC 标准差
+- **验证集 IC > 0.03**：确保样本外有效性
+- **训练/验证集方向一致**：避免过拟合
+
+### 改进优先级
+1. **先修P0问题**（方向错误、过拟合），再优化P1（IC弱、IR低），最后尝试P2突破
+2. **保持EVOLVE-BLOCK结构**，函数签名 `def compute_factor(data: pd.DataFrame) -> pd.Series:` 不变
+3. **保留已验证有效的子因子**（如 BP/EP/低波动），在此基础上调整组合权重、窗口参数或引入互补因子
+4. **参考知识库案例**：知识库中的案例是已验证的成功经验，请优先参考
+
+### A股关键特征
+- 短期反转效应最强（-pct_change(5)），散户市场特征
+- 低波动异象有效（-rolling_std(20)）
+- 价值因子（BP/EP）稳健但IC偏低，需要多因子组合
+- 行业市值中性化很重要，A股行业轮动频繁
+- 因子衰减速度：动量类衰减快，价值类耐久
+
+### 多因子组合原则
+- 子因子控制在2-4个，多了容易过拟合
+- 先用 ts_z 做时序标准化，再等权或 ICIR 加权组合
+- 选择低相关（<0.4）甚至负相关的正交因子
+- 组合后做行业市值中性化
+
+### 不要做的事
+- 不要抛弃已验证有效的子因子方向（如 BP/EP 在当前数据上有效就别丢掉）
+- 不要组合超过4个子因子（过拟合风险）
+- 不要使用方向相反的子因子（信号对冲）
+- 不要用太短的窗口（<5日），噪声太大
+- 不要过度依赖技术指标（2016后有效性下降）
+
+## 输出格式
+
+输出完整的 compute_factor 函数代码（保持 EVOLVE-BLOCK 结构）：
+
+```python
+# EVOLVE-BLOCK-START
+def compute_factor(data: pd.DataFrame) -> pd.Series:
+    # 你的因子计算逻辑
+    ...
+    return factor
+# EVOLVE-BLOCK-END
+```
+
+只输出 EVOLVE-BLOCK 内的代码，保持函数签名一致。直接给出完整代码。

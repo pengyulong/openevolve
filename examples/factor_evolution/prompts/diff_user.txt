@@ -1,0 +1,75 @@
+## 当前因子代码
+
+```python
+{current_program}
+```
+
+## 评估结果概览
+
+| 指标 | 当前值 | 目标值 | 状态 |
+|------|--------|--------|------|
+| train_rank_ic_mean | {train_ic_current} | >0.08 | {train_ic_status} |
+| train_rank_ic_ir | {train_ir_current} | >0.5 | {train_ir_status} |
+| val_rank_ic_mean | {val_ic_current} | >0.03 | {val_ic_status} |
+| val_rank_ic_ir | {val_ir_current} | >0.3 | {val_ir_status} |
+| 综合评分 | {fitness_score} | 1.0 | {score_status} |
+
+{ic_trend_table}
+
+## 诊断结果（按优先级排序）
+
+{diagnostics_prio}
+
+## 具体参数调整建议
+
+{parameter_suggestions}
+
+## 知识库参考案例（与当前问题相似的改进经验）
+
+{knowledge_base_context}
+
+## 优秀因子示例与演化历史
+
+{evolution_history}
+
+## 改进规则
+
+1. **先修P0问题**，再优化P1，最后尝试P2突破
+2. **只修改EVOLVE-BLOCK内的代码**，保持函数签名不变
+3. **使用SEARCH/REPLACE格式**输出修改
+4. **核心目标**：**正IC > 0.08**, IC_IR > 0.5, 训练集/验证集方向一致
+
+## 输出格式要求
+
+你必须使用下面的 SEARCH/REPLACE diff 格式来输出代码修改：
+
+<<<<<<< SEARCH
+# 要替换的原始代码（必须与当前程序中的代码完全匹配）
+=======
+# 替换后的新代码
+>>>>>>> REPLACE
+
+示例：
+<<<<<<< SEARCH
+    # 简单的20日动量因子：过去20天的收益率
+    momentum_20d = data['close'].pct_change(20)
+
+    return momentum_20d
+=======
+    # 短期反转 + 低波动率复合因子（正IC方向）
+    # 1. 短期反转（取负 → 正IC）
+    reversal = -data['close'].pct_change(5)
+    # 2. 低波动率（取负 → 正IC）
+    volatility = -data['close'].pct_change(1).rolling(20).std()
+    # 3. 标准化后等权组合
+    def ts_z(s, w=60):
+        return (s - s.rolling(w, min_periods=30).mean()) / (s.rolling(w, min_periods=30).std() + 1e-8)
+    factor = 0.5 * ts_z(reversal) + 0.5 * ts_z(volatility)
+    return factor.clip(-3, 3)
+>>>>>>> REPLACE
+
+重要规则：
+- SEARCH 部分必须与当前代码精确匹配
+- 不要重写整个程序，只修改 EVOLVE-BLOCK 内的因子计算逻辑
+- 可以包含多个 SEARCH/REPLACE 块
+- 先分析问题再给出修改

@@ -19,6 +19,15 @@ from openevolve.utils.metrics_utils import safe_numeric_average
 
 logger = logging.getLogger(__name__)
 
+# Worker globals (initialized by _worker_init in each worker process)
+_worker_config: Optional[Config] = None
+_worker_evaluation_file: Optional[str] = None
+_worker_evaluator = None
+_worker_llm_ensemble = None
+_worker_prompt_sampler = None
+_worker_kb_config: Optional[dict] = None
+_worker_knowledge_writer = None
+
 
 @dataclass
 class SerializableResult:
@@ -37,16 +46,24 @@ class SerializableResult:
 def _worker_init(config_dict: dict, evaluation_file: str, parent_env: dict = None) -> None:
     """Initialize worker process with necessary components"""
     import os
-    
+
     # Set environment from parent process
     if parent_env:
         os.environ.update(parent_env)
-    
+
+    # Configure logging for worker process so INFO level messages are visible
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        force=True,
+    )
+
     global _worker_config
     global _worker_evaluation_file
     global _worker_evaluator
     global _worker_llm_ensemble
     global _worker_prompt_sampler
+    global _worker_kb_config
 
     # Store config for later use
     # Reconstruct Config object from nested dictionaries
@@ -92,12 +109,21 @@ def _worker_init(config_dict: dict, evaluation_file: str, parent_env: dict = Non
     _worker_llm_ensemble = None
     _worker_prompt_sampler = None
 
+    # Knowledge base config (stored for lazy init)
+    _worker_kb_config = config_dict.get("knowledge_base")
+    if _worker_kb_config:
+        logger.info(f"KB config loaded in worker init: enabled={_worker_kb_config.get('enabled')}, module_dir={_worker_kb_config.get('module_dir')}")
+        logger.info(f"KB config received (enabled={_worker_kb_config.get('enabled')})")
+    else:
+        logger.warning(f"No KB config in config_dict keys={list(config_dict.keys())}")
+
 
 def _lazy_init_worker_components():
     """Lazily initialize expensive components on first use"""
     global _worker_evaluator
     global _worker_llm_ensemble
     global _worker_prompt_sampler
+    global _worker_kb_config
 
     if _worker_llm_ensemble is None:
         from openevolve.llm.ensemble import LLMEnsemble
@@ -108,6 +134,16 @@ def _lazy_init_worker_components():
         from openevolve.prompt.sampler import PromptSampler
 
         _worker_prompt_sampler = PromptSampler(_worker_config.prompt)
+
+    # Initialize knowledge base retriever if configured
+    if _worker_kb_config and _worker_kb_config.get("enabled") and _worker_prompt_sampler._knowledge_retriever_callback is None:
+        try:
+            logger.info("Initializing KB retriever in worker process...")
+            _init_worker_kb_retriever()
+        except Exception as e:
+            logger.warning(f"Failed to initialize KB retriever in worker: {e}")
+            import traceback
+            logger.warning(traceback.format_exc())
 
     if _worker_evaluator is None:
         from openevolve.evaluator import Evaluator
@@ -127,6 +163,139 @@ def _lazy_init_worker_components():
             database=None,  # No shared database in worker
             suffix=getattr(_worker_config, 'file_suffix', '.py'),
         )
+
+
+def _init_worker_kb_retriever():
+    """Initialize knowledge base retriever in worker process"""
+    global _worker_kb_config, _worker_prompt_sampler, _worker_evaluation_file
+
+    if not _worker_kb_config or not _worker_kb_config.get("enabled", False):
+        return
+
+    import sys
+    import os
+
+    # Determine the knowledge_base module path
+    kb_config = _worker_kb_config
+    kb_dir = kb_config.get("module_dir", "")
+
+    logger.info(f"_init_worker_kb_retriever called: kb_dir={kb_dir}")
+
+    # Resolve relative paths using the evaluation file's parent directory
+    if kb_dir and not os.path.isabs(kb_dir):
+        eval_parent = os.path.dirname(os.path.abspath(_worker_evaluation_file))
+        kb_dir = os.path.join(eval_parent, kb_dir)
+
+    logger.info(f"Resolved KB dir: {kb_dir}, sys.path[0]={sys.path[0] if sys.path else 'empty'}")
+
+    if kb_dir and kb_dir not in sys.path:
+        # kb_dir is the knowledge_base/ directory itself.
+        # For "from knowledge_base import X" to work, the PARENT directory
+        # (containing knowledge_base/) must be on sys.path, not kb_dir itself.
+        parent_dir = os.path.dirname(kb_dir)
+        if parent_dir not in sys.path:
+            sys.path.insert(0, parent_dir)
+        logger.info(f"Added to sys.path: {parent_dir}")
+
+    # Resolve db_path and seed_file paths
+    db_path = kb_config.get("db_path", "./knowledge_base/kb_store.db")
+    seed_file = kb_config.get("seed_file", "")
+
+    if not os.path.isabs(db_path):
+        eval_parent = os.path.dirname(os.path.abspath(_worker_evaluation_file))
+        db_path = os.path.join(eval_parent, db_path)
+    if seed_file and not os.path.isabs(seed_file):
+        eval_parent = os.path.dirname(os.path.abspath(_worker_evaluation_file))
+        seed_file = os.path.join(eval_parent, seed_file)
+
+    try:
+        from knowledge_base import KnowledgeBase, KBEmbedder, KnowledgeRetriever
+
+        # Initialize KB
+        kb = KnowledgeBase(db_path=db_path)
+
+        # Auto-import seed data if KB is empty
+        if kb.count() == 0 and seed_file and os.path.exists(seed_file):
+            logger.info(f"KB empty, importing seed data from {seed_file}")
+            kb.import_from_json(seed_file)
+
+        # Initialize embedder with API key from LLM config
+        embedding_api_key = kb_config.get("embedding_api_key")
+        embedding_base_url = kb_config.get("embedding_base_url")
+
+        # Fall back to LLM config's API key
+        if not embedding_api_key and _worker_config and _worker_config.llm.models:
+            embedding_api_key = _worker_config.llm.models[0].api_key
+        if not embedding_base_url and _worker_config and _worker_config.llm.models:
+            embedding_base_url = _worker_config.llm.models[0].api_base
+
+        embedder = KBEmbedder(
+            api_key=embedding_api_key,
+            base_url=embedding_base_url,
+            model=kb_config.get("embedding_model", "text-embedding-3-small"),
+            dim=kb_config.get("embedding_dim", 1536),
+            local_embedding_url=kb_config.get("embedding_local_url"),
+        )
+
+        # Initialize retriever
+        top_k = kb_config.get("retrieval_top_k", 5)
+        retriever = KnowledgeRetriever(kb=kb, embedder=embedder, top_k=top_k)
+
+        # Set callback on prompt sampler
+        def retrieval_callback(program_code, program_metrics):
+            return retriever.retrieve_and_format(program_metrics, program_code)
+
+        _worker_prompt_sampler.set_knowledge_retriever(retrieval_callback)
+
+        # Initialize KnowledgeWriter for writeback
+        global _worker_knowledge_writer
+        try:
+            from knowledge_base import KnowledgeWriter
+
+            writeback_threshold = kb_config.get("writeback_threshold", 0.15)
+            use_llm_summary = kb_config.get("use_llm_summary", True)
+
+            llm_client = None
+            if use_llm_summary and _worker_config and _worker_config.llm.models:
+                try:
+                    from openai import OpenAI
+                    first_model = _worker_config.llm.models[0]
+                    llm_client = OpenAI(
+                        api_key=first_model.api_key,
+                        base_url=first_model.api_base,
+                    )
+                    # Attach model name for KnowledgeWriter compatibility
+                    llm_client.model = first_model.model
+                    logger.info("LLM client created for knowledge writeback summary")
+                except Exception as e:
+                    logger.warning(f"Cannot create LLM client for writeback: {e}, using template mode")
+                    use_llm_summary = False
+
+            _worker_knowledge_writer = KnowledgeWriter(
+                kb=kb,
+                embedder=embedder,
+                writeback_threshold=writeback_threshold,
+                use_llm_summary=use_llm_summary,
+                llm_client=llm_client,
+            )
+            logger.info(
+                f"KnowledgeWriter initialized (threshold={writeback_threshold}, llm={use_llm_summary})"
+            )
+        except ImportError as e:
+            logger.warning(f"KnowledgeWriter module not importable: {e}")
+        except Exception as e:
+            logger.warning(f"KnowledgeWriter init failed: {e}")
+
+        logger.info(
+            f"KB retriever initialized: {kb.count()} active entries (db={db_path})"
+        )
+
+    except ImportError as e:
+        logger.warning(f"Knowledge base module not importable in worker: {e}")
+    except Exception as e:
+        logger.warning(f"Knowledge base init failed in worker: {e}")
+        import traceback
+        logger.warning(traceback.format_exc())
 
 
 def _run_iteration_worker(
@@ -212,7 +381,7 @@ def _run_iteration_worker(
             child_code = apply_diff(parent.code, llm_response)
             changes_summary = format_diff_summary(diff_blocks)
         else:
-            from openevolve.utils.code_utils import parse_full_rewrite
+            from openevolve.utils.code_utils import parse_full_rewrite, wrap_full_rewrite
 
             new_code = parse_full_rewrite(llm_response, _worker_config.language)
             if not new_code:
@@ -220,7 +389,7 @@ def _run_iteration_worker(
                     error=f"No valid code found in response", iteration=iteration
                 )
 
-            child_code = new_code
+            child_code = wrap_full_rewrite(parent.code, new_code)
             changes_summary = "Full rewrite"
 
         # Check code length
@@ -256,6 +425,41 @@ def _run_iteration_worker(
         )
 
         iteration_time = time.time() - iteration_start
+
+        # Knowledge writeback: detect significant improvements > writeback threshold
+        try:
+            if _worker_knowledge_writer is not None:
+                parent_score = parent.metrics.get("combined_score", 0)
+                child_score = child_metrics.get("combined_score", 0)
+                if parent_score > 0 and child_score > 0:
+                    improvement_pct = (child_score - parent_score) / parent_score
+                    writeback_threshold = _worker_kb_config.get("writeback_threshold", 0.15)
+                    if improvement_pct > writeback_threshold:
+                        # Extract problem codes from parent diagnostics
+                        parent_diag = parent.metrics.get("_diagnostics_raw", {})
+                        problem_codes = []
+                        if isinstance(parent_diag, dict):
+                            for issue in parent_diag.get("priority_issues", []):
+                                code = issue.get("code", "")
+                                if code and code != "ALL_GOOD":
+                                    problem_codes.append(code)
+
+                        kb_id = _worker_knowledge_writer.writeback(
+                            parent_code=parent.code,
+                            child_code=child_code,
+                            parent_metrics=parent.metrics,
+                            child_metrics=child_metrics,
+                            problem_codes=problem_codes,
+                        )
+                        if kb_id:
+                            logger.info(
+                                f"Iteration {iteration}: Knowledge writeback triggered "
+                                f"(improvement: +{improvement_pct:.1%}, "
+                                f"score: {parent_score:.3f}→{child_score:.3f}, "
+                                f"entry={kb_id})"
+                            )
+        except Exception as e:
+            logger.warning(f"Knowledge writeback failed non-critically: {e}")
 
         return SerializableResult(
             child_program_dict=child_program.to_dict(),
@@ -324,6 +528,7 @@ class ProcessParallelController:
             "max_code_length": config.max_code_length,
             "language": config.language,
             "file_suffix": self.file_suffix,
+            "knowledge_base": config.knowledge_base,
         }
 
     def start(self) -> None:
