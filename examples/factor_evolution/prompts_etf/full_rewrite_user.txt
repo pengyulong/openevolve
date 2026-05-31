@@ -1,0 +1,82 @@
+## 当前策略代码
+
+```python
+{current_program}
+```
+
+## 评估结果
+
+| 指标 | 当前值 | 目标 | 状态 |
+|------|--------|------|------|
+| 综合评分 | {fitness_score} | >0.6 | {score_status} |
+| 平均年化收益 | {avg_return} | >25% | {return_status} |
+| 平均Calmar | {avg_calmar} | >2.0 | {calmar_status} |
+| 最差年收益 | {worst_year} | >0% | {worst_status} |
+| 盈利年份数 | {profitable_folds}/6 | 6/6 | {folds_status} |
+
+## 各年度表现
+
+{fold_results_table}
+
+## 诊断分析
+
+{diagnostics}
+
+## 竞争态势
+
+{competition_context}
+
+## 知识库参考
+
+{knowledge_base_context}
+
+## 优秀策略参考
+
+{evolution_history}
+
+## 改进指南
+
+{island_hint}
+
+### 核心改进方向
+
+基于当前策略的表现，你需要改进策略使其在所有年份（2019-2024）都能盈利，同时追求更高的Calmar比率。
+
+关键思考维度：
+1. **风险管理**：滑动止损逻辑是否合理？熊市（2018/2022）如何规避？
+2. **择时能力**：什么信号可以判断市场环境（牛/熊/震荡）？
+3. **行业选择**：动量、反转、资金流哪个信号更有效？
+4. **仓位控制**：何时满仓、何时减仓、何时空仓？
+5. **因子组合**：如何综合多个信号做出更稳健的决策？
+
+### 可利用的独特信号
+- `share_chg_pct`：ETF份额变动率，机构/国家队大额申购的日频代理
+- `volatility_20d`：短期波动率跳升往往预示风险
+- `ma60_bias`：价格偏离60日均线的幅度，极端偏离意味着回归
+
+### 不要做的事
+- 不要只用单一信号（如纯动量）
+- 不要忽视风控（必须有止损/减仓机制）
+- 不要全仓单一ETF
+- 不要引入前视偏差
+- 参数不要硬编码magic number（用可解释的逻辑）
+
+## 输出格式
+
+输出完整的 compute_strategy 函数（保持 EVOLVE-BLOCK 结构）：
+
+```python
+# EVOLVE-BLOCK-START
+def compute_strategy(
+    etf_data: Dict[str, pd.DataFrame],
+    current_date: pd.Timestamp,
+    current_holdings: Dict[str, float],
+    entry_prices: Dict[str, float],
+) -> Dict[str, float]:
+    # 你的策略逻辑
+    ...
+    return target_weights
+# EVOLVE-BLOCK-END
+```
+
+只输出 EVOLVE-BLOCK 内的代码，保持函数签名一致。

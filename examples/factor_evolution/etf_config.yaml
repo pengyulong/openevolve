@@ -1,0 +1,133 @@
+# A股ETF策略自动演化配置
+
+# Tushare 配置
+tushare_token: "${TUSHARE_TOKEN}"
+
+# 语言设置
+language: python
+max_code_length: 12288
+
+# 探索性变异：每8次迭代强制创新
+exploration_interval: 8
+
+# 岛屿分化策略（6个岛，每个专攻一个方向）
+island_hints:
+  - "【方向：Regime Detection】优先探索市场状态判断+动态仓位控制，目标是在熊市自动减仓/空仓。"
+  - "【方向：资金流驱动】优先探索ETF份额变动信号，大资金申赎作为核心决策依据。"
+  - "【方向：风险平价】优先探索波动率管理策略，按风险预算分配权重，目标控制回撤。"
+  - "【方向：动量轮动】优先探索多时间尺度动量信号，行业ETF间的相对强度轮动。"
+  - "【方向：红利+增强】优先探索红利底仓+卫星仓位增强的混合策略。"
+  - "【方向：自由探索】不限方向，大胆尝试全新逻辑（如日历效应、跨市场联动等）。"
+
+# LLM 配置
+llm:
+  models:
+    - name: "deepseek-v4-flash"
+      weight: 1.0
+      api_key: "${LLM_API_KEY}"
+      api_base: "${LLM_API_BASE}"
+  temperature: 0.85
+  max_tokens: 6144
+  retries: 3
+  timeout: 600
+
+# 数据库配置 (MAP-Elites + 岛屿模型)
+database:
+  population_size: 60
+  num_islands: 6
+  migration_interval: 30
+  exploration_ratio: 0.35
+  exploitation_ratio: 0.35
+
+  # MAP-Elites 特征维度
+  feature_dimensions:
+    - "avg_calmar"           # 平均Calmar比率
+    - "worst_year_return"    # 最差年收益
+    - "avg_trades_per_year"  # 平均交易频次
+    - "consistency"          # 一致性（年度波动小）
+  feature_bins: 5
+
+# 评估器配置
+evaluator:
+  timeout: 600              # 6折CV + 快速预评估
+  parallel_evaluations: 1
+  cascade_evaluation: false
+
+# 提示配置
+prompt:
+  num_top_programs: 3
+  num_diverse_programs: 2
+  include_artifacts: false
+  template_dir: "./prompts_etf"
+  system_message: "system_message"
+
+# 进化配置
+diff_based_evolution: false
+
+# 检查点
+checkpoint_interval: 20
+
+# 知识库配置
+knowledge_base:
+  enabled: true
+  module_dir: "./knowledge_base"
+  db_path: "./knowledge_base_etf/kb_store.db"
+  seed_file: "./knowledge_base_etf/seed_knowledge.json"
+  retrieval_top_k: 4
+  rule_filter_min_candidates: 8
+  writeback_threshold: 0.05
+  writeback_abs_threshold: 0.03
+  use_llm_summary: true
+  embedding_local_url: "http://10.153.108.18:8190/llm_service/embedding"
+  embedding_model: "local-bge"
+  embedding_dim: 768
+  feedback_threshold: 0.0
+  pruning_enabled: true
+  pruning_min_retrievals: 3
+  pruning_max_consecutive_failures: 5
+  pruning_min_quality_score: 0.1
+  # 负面知识自动录入
+  negative_feedback_enabled: true
+  negative_feedback_threshold: 0.02
+  negative_feedback_max_per_category: 3
+
+# Expert Advisor 配置（专家监督模式）
+expert_advisor:
+  enabled: true
+  trigger_mode: "both"      # stagnation + after_pruning 均触发
+  llm:
+    model: "gpt-5.5"
+    api_key: "sk-Y7WaF5QEbbDSEwuvC95b5c9d7e3a4a2dBb8790500907073c"
+    api_base: "https://oneapi-comate.baidu-int.com/v1"
+    temperature: 0.7
+    max_tokens: 4096
+  trigger_conditions:
+    stagnation_rounds: 12   # 12轮无进步触发专家介入
+    after_pruning: true     # 知识库剪枝后也触发
+    max_frequency: 30       # 最多每30轮介入一次
+  tools:
+    market_regime:
+      enabled: true
+      description: "分析当前市场环境(牛/熊/震荡)，为策略方向提供建议"
+    academic_paper:
+      enabled: true
+      max_results: 5
+      description: "检索量化策略相关学术论文，提供新思路"
+    web_search:
+      enabled: true
+      max_results: 3
+      description: "搜索最新的A股ETF策略研究和市场分析"
+    failure_analysis:
+      enabled: true
+      description: "分析近期失败策略的共性问题，避免重复犯错"
+  # 专家介入时的额外上下文
+  context:
+    target_return: "25%年化"
+    max_drawdown: "15%"
+    instrument: "A股行业ETF/宽基ETF"
+    cv_period: "2019-2024年6折CV"
+    hard_years: "2022年(熊市)、2023年(结构市)"
+  cache:
+    db_path: "./knowledge_base_etf/expert_cache.db"
+    ttl_seconds: 604800     # 7天缓存
+  max_entries_per_run: 5

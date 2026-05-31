@@ -1,0 +1,109 @@
+## 当前因子代码
+
+```python
+{current_program}
+```
+
+## 评估结果概览
+
+| 指标 | 当前值 | 目标值 | 状态 |
+|------|--------|--------|------|
+| train_rank_ic_mean | {train_ic_current} | >0.08 | {train_ic_status} |
+| train_rank_ic_ir | {train_ir_current} | >0.5 | {train_ir_status} |
+| val_rank_ic_mean | {val_ic_current} | >0.03 | {val_ic_status} |
+| val_rank_ic_ir | {val_ir_current} | >0.3 | {val_ir_status} |
+| 综合评分 | {fitness_score} | 1.0 | {score_status} |
+
+{ic_trend_table}
+
+## 诊断结果（按优先级排序）
+
+{diagnostics_prio}
+
+## 竞争态势与进化目标
+
+{competition_context}
+
+## 知识库参考案例
+
+{knowledge_base_context}
+
+## 优秀因子代码参考
+
+{evolution_history}
+
+## 探索性改进指南（本轮为强制创新轮次）
+
+{island_hint}
+
+### 本轮核心目标
+
+**必须尝试全新的因子逻辑**，不可简单调整现有因子的参数/权重/窗口。
+
+当前因子已陷入局部最优，需要结构性创新来突破。你应该：
+- 完全重新设计因子计算逻辑
+- 不需要保留任何现有子因子
+- 大胆尝试从未用过的数据列或组合方式
+- 可以牺牲短期 IC 来换取探索新方向
+
+### 创新方向参考（选择1-2个深入尝试）
+
+1. **非线性交互因子**
+   - 因子A × 因子B 的乘积项（如 BP × 低波动）
+   - 条件因子：if 市场环境A then 因子X else 因子Y
+   - 分位数交互：高BP中的低波动 vs 低BP中的低波动
+
+2. **高阶统计量因子**
+   - 收益率偏度（skewness）: 负偏度 → 正IC
+   - 收益率峰度（kurtosis）: 极端尾部风险
+   - 波动率的波动率（vol of vol）
+   - 上下行波动率之比（downside ratio）
+
+3. **量价联动因子**
+   - 量价背离：价格上涨但成交量萎缩
+   - OBV（On-Balance Volume）变体
+   - 价量相关性（price-volume correlation）
+   - 智能资金指标：(high - close) / (high - low) × volume
+
+4. **事件驱动/状态切换因子**
+   - 突破检测：close vs N日高点的相对位置
+   - 均线穿越后的持续天数
+   - 波动率 regime（高波动→低波动的转换）
+   - 成交量突变检测（相对于自身历史）
+
+5. **相对强度/偏离度因子**
+   - 个股收益 vs 等权平均的偏离度
+   - 价格相对强度（RPS）：个股在全市场的排名变化
+   - 因子值的时间序列动量（因子值在上升的股票）
+
+6. **基本面动量因子**
+   - PE/PB 的时间序列变化率（估值改善/恶化）
+   - 换手率的趋势（加速/减速）
+   - 市值变化率（非价格驱动部分）
+
+### A股关键特征（仍需遵守）
+- 短期反转效应最强，散户市场特征
+- 低波动异象有效
+- 行业市值中性化很重要
+- 因子衰减速度各异
+
+### 不要做的事（安全底线）
+- 不要只调整现有因子的权重或窗口参数（本轮禁止）
+- 不要组合超过4个子因子
+- 不要用太短的窗口（<5日）
+- 不要引入前视偏差
+
+## 输出格式
+
+输出完整的 compute_factor 函数代码（保持 EVOLVE-BLOCK 结构）：
+
+```python
+# EVOLVE-BLOCK-START
+def compute_factor(data: pd.DataFrame) -> pd.Series:
+    # 你的全新因子计算逻辑
+    ...
+    return factor
+# EVOLVE-BLOCK-END
+```
+
+只输出 EVOLVE-BLOCK 内的代码，保持函数签名一致。直接给出完整代码。

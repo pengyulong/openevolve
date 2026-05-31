@@ -1,0 +1,82 @@
+[
+  {
+    "id": "etf_regime_detection",
+    "category": "market_regime",
+    "title": "市场状态判断方法",
+    "content": "A股市场有明显的牛熊周期。有效的regime判断信号：(1)20日波动率>25%且均线空头排列=熊市；(2)宽基ETF份额连续5日增长+价格突破60日均线=牛市启动；(3)成交量萎缩+窄幅震荡=震荡市。熊市中应大幅减仓至30%以下甚至空仓。",
+    "tags": ["regime", "risk_management", "volatility"],
+    "quality_score": 0.8
+  },
+  {
+    "id": "etf_share_flow_signal",
+    "category": "fund_flow",
+    "title": "ETF份额变动作为资金流信号",
+    "content": "ETF份额变动(share_chg_pct)是机构资金动向的日频代理。关键规律：(1)宽基ETF(510300/510500)份额单日增长>3%通常是国家队或险资入场；(2)行业ETF份额连续3日增长>1%预示该行业即将启动；(3)全市场ETF份额普遍萎缩是系统性风险信号。注意：份额数据偶有缺失需做前向填充。",
+    "tags": ["fund_flow", "institutional", "sovereign_fund"],
+    "quality_score": 0.7
+  },
+  {
+    "id": "etf_dividend_base",
+    "category": "portfolio_construction",
+    "title": "红利ETF底仓策略",
+    "content": "红利类ETF(中证红利/红利低波)在A股有持续超额收益，尤其在熊市和震荡市。可作为底仓(20-30%权重)提供收益稳定器。但在成长股暴涨期(如2020年)会显著跑输，需要动态调整红利仓位：牛市减至10%，熊市加至40%。红利低波ETF(512890)的防御性优于纯红利ETF。",
+    "tags": ["dividend", "portfolio", "defensive"],
+    "quality_score": 0.8
+  },
+  {
+    "id": "etf_momentum_reversal",
+    "category": "factor_signal",
+    "title": "A股ETF动量与反转效应",
+    "content": "A股行业ETF的动量/反转特征：(1)5-10日尺度反转效应显著（超跌反弹）；(2)20-60日尺度动量效应有效（趋势跟随）；(3)动量因子在熊市会严重失效（追涨杀跌）。最佳实践：在波动率正常时用动量，在波动率飙升时切换为反转。动量衰减期约2-3个月，超过3个月的动量信号可能已过时。",
+    "tags": ["momentum", "reversal", "timing"],
+    "quality_score": 0.7
+  },
+  {
+    "id": "etf_stop_loss_design",
+    "category": "risk_management",
+    "title": "滑动止损设计经验",
+    "content": "ETF策略的止损设计要点：(1)固定止损(-8%到-10%)适合趋势策略；(2)滑动止损(从最高价回撤N%)适合动量策略，让利润奔跑；(3)组合层面止损比个股止损更重要——组合月度回撤超5%应减仓50%；(4)不设止盈，但可设'利润保护'——赚超10%后止损位上移至保本；(5)止损触发后不要立即反手，等待3-5日冷静期。",
+    "tags": ["stop_loss", "risk_management", "trailing_stop"],
+    "quality_score": 0.8
+  },
+  {
+    "id": "etf_position_sizing",
+    "category": "portfolio_construction",
+    "title": "仓位控制与现金管理",
+    "content": "仓位控制是控制回撤的核心手段。经验规则：(1)市场波动率(VIX等价物)>25%时总仓位不超过50%；(2)信号不明确时保持30%现金；(3)永远不要满仓（留10%应急现金）；(4)新建仓位分批建（分2-3次建仓，每次间隔2-3天）；(5)权重上限：单只ETF不超过20%，单一行业不超过30%。这些规则可有效将最大回撤控制在15%以内。",
+    "tags": ["position_sizing", "cash_management", "risk_control"],
+    "quality_score": 0.8
+  },
+  {
+    "id": "etf_volatility_regime",
+    "category": "market_regime",
+    "title": "波动率regime切换信号",
+    "content": "波动率是最强的regime信号。实用判断：(1)20日波动率从低位(15%以下)突然翻倍→风险来临，减仓；(2)波动率持续高位(>30%)超过20天后开始回落→底部区域，可逐步加仓；(3)ETF振幅(amplitude)连续3天收窄到历史低位→即将变盘（但不确定方向）。波动率信号的优势是领先于价格信号1-3天。",
+    "tags": ["volatility", "regime", "risk_signal"],
+    "quality_score": 0.7
+  },
+  {
+    "id": "etf_2022_bear_lesson",
+    "category": "negative_knowledge",
+    "title": "2022年全面熊市的教训",
+    "content": "2022年几乎所有行业ETF下跌(除煤炭/红利)，纯动量策略在此年必然大亏。有效的防御手段：(1)用均线空头排列+波动率飙升作为减仓触发；(2)全市场下跌时只持有红利低波ETF或空仓；(3)反弹不追（2022年多次假反弹后继续暴跌）；(4)4月和10月是年内最大跌幅发生月份。纯动量策略在2022年亏损通常超过20%。",
+    "tags": ["bear_market", "2022", "defensive", "lesson"],
+    "quality_score": 0.9
+  },
+  {
+    "id": "etf_2023_structural_lesson",
+    "category": "negative_knowledge",
+    "title": "2023年结构性行情的教训",
+    "content": "2023年市场分化极端：AI/中特估暴涨，消费/医药/新能源暴跌。教训：(1)行业动量因子失效——领涨板块切换太快；(2)要用行业轮动而非单纯追涨；(3)持仓分散度要够高(至少5-6只ETF)才能捕获结构性机会；(4)AI行情在6月后见顶回落，追高者损失惨重。该年最优策略是红利+AI的杠铃组合。",
+    "tags": ["structural_market", "2023", "diversification", "lesson"],
+    "quality_score": 0.85
+  },
+  {
+    "id": "etf_pure_momentum_failure",
+    "category": "negative_knowledge",
+    "title": "纯动量策略在A股ETF上失效的原因",
+    "content": "纯动量策略（如只买20日涨幅最大的ETF）在A股长期表现差的原因：(1)行业轮动速度太快，等动量形成时已近顶部；(2)A股短期反转效应强于动量效应；(3)熊市中动量=追涨杀跌，加速亏损。改进方案：动量+波动率过滤（高波时关闭动量）、动量+反转混合（震荡市用反转）、或用相对强度排名变化代替绝对动量。",
+    "tags": ["momentum", "failure_mode", "improvement"],
+    "quality_score": 0.85
+  }
+]
