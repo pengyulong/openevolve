@@ -356,6 +356,16 @@ class Config:
     # Evolution settings
     diff_based_evolution: bool = True
     max_code_length: int = 10000
+    exploration_interval: int = 0  # Force exploration prompt every N iterations (0=disabled)
+
+    # Island differentiation hints (list of strings, one per island)
+    island_hints: List[str] = field(default_factory=list)
+
+    # Knowledge base settings (optional, for domain-specific knowledge retrieval)
+    knowledge_base: Optional[Dict[str, Any]] = None
+
+    # Expert Advisor settings (optional, for external knowledge injection)
+    expert_advisor: Optional[Dict[str, Any]] = None
 
     # Early stopping settings
     early_stopping_patience: Optional[int] = None
@@ -365,8 +375,24 @@ class Config:
     @classmethod
     def from_yaml(cls, path: Union[str, Path]) -> "Config":
         """Load configuration from a YAML file"""
+        import re, os
+
         with open(path, "r") as f:
             config_dict = yaml.safe_load(f)
+
+        # Substitute ${ENV_VAR} placeholders with environment variable values
+        def _subst(value):
+            if isinstance(value, str):
+                def _replace(m):
+                    return os.environ.get(m.group(1), m.group(0))
+                return re.sub(r'\$\{(\w+)\}', _replace, value)
+            elif isinstance(value, dict):
+                return {k: _subst(v) for k, v in value.items()}
+            elif isinstance(value, list):
+                return [_subst(v) for v in value]
+            return value
+
+        config_dict = _subst(config_dict)
         return cls.from_dict(config_dict)
 
     @classmethod
@@ -402,6 +428,10 @@ class Config:
             config.evaluator = EvaluatorConfig(**config_dict["evaluator"])
         if "evolution_trace" in config_dict:
             config.evolution_trace = EvolutionTraceConfig(**config_dict["evolution_trace"])
+        if "knowledge_base" in config_dict:
+            config.knowledge_base = config_dict["knowledge_base"]
+        if "expert_advisor" in config_dict:
+            config.expert_advisor = config_dict["expert_advisor"]
 
         return config
 

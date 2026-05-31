@@ -29,6 +29,10 @@ class PromptSampler:
         self.system_template_override = None
         self.user_template_override = None
 
+        # Optional knowledge base retrieval callback
+        # Signature: (program_code: str, program_metrics: dict) -> str
+        self._knowledge_retriever_callback = None
+
         # Only log once to reduce duplication
         if not hasattr(logger, "_prompt_sampler_logged"):
             logger.info("Initialized prompt sampler")
@@ -48,6 +52,19 @@ class PromptSampler:
         self.user_template_override = user_template
         logger.info(f"Set custom templates: system={system_template}, user={user_template}")
 
+    def set_knowledge_retriever(self, callback: callable) -> None:
+        """
+        Set a knowledge base retrieval callback.
+
+        The callback receives (program_code: str, program_metrics: dict) and
+        returns a formatted knowledge context string to inject into prompts.
+
+        Args:
+            callback: Function with signature (str, dict) -> str
+        """
+        self._knowledge_retriever_callback = callback
+        logger.info("Knowledge retriever callback set for PromptSampler")
+
     def build_prompt(
         self,
         current_program: str = "",
@@ -62,6 +79,7 @@ class PromptSampler:
         template_key: Optional[str] = None,
         program_artifacts: Optional[Dict[str, Union[str, bytes]]] = None,
         feature_dimensions: Optional[List[str]] = None,
+        knowledge_base_context: str = "",
         **kwargs: Any,
     ) -> Dict[str, str]:
         """
@@ -134,6 +152,71 @@ class PromptSampler:
         fitness_score = get_fitness_score(program_metrics, feature_dimensions)
         feature_coords = format_feature_coordinates(program_metrics, feature_dimensions)
 
+        # ═══ 提取因子评估特有的结构化字段 ═══
+        # 这些字段由 CrossSectionalICEvaluator 生成
+        train_ic_current = program_metrics.get("train_rank_ic_mean", 0)
+        train_ir_current = program_metrics.get("train_rank_ic_ir", 0)
+        val_ic_current = program_metrics.get("val_rank_ic_mean", 0)
+        val_ir_current = program_metrics.get("val_rank_ic_ir", 0)
+
+        # 计算状态（目标：IC > 0.08, IR > 0.5）
+        def ic_status(ic):
+            if ic > 0.08:
+                return "✓ 达标"  # 达到目标
+            elif ic > 0.05:
+                return "○ 接近"  # 接近目标
+            elif ic > 0.03:
+                return "△ 偏弱"  # 需要提升
+            elif ic > 0:
+                return "▼ 较弱"  # 差距较大
+            else:
+                return "✗ 无效"
+
+        def ir_status(ir):
+            if ir > 0.5:
+                return "✓ 达标"
+            elif ir > 0.4:
+                return "○ 接近"
+            elif ir > 0.3:
+                return "△ 偏弱"
+            else:
+                return "▼ 较弱"
+
+        def score_status(score):
+            if score > 0.8:
+                return "✓ 优秀"  # IC > 0.08
+            elif score > 0.6:
+                return "○ 良好"  # IC > 0.05
+            elif score > 0.4:
+                return "△ 一般"  # IC > 0.03
+            elif score > 0.2:
+                return "▼ 较弱"
+            else:
+                return "✗ 需改进"
+
+        # 获取结构化诊断信息（由因子评估器生成）
+        diagnostics_prio = program_metrics.get("_diagnostics_prio", improvement_areas)
+        parameter_suggestions = program_metrics.get("_parameter_suggestions", "无具体建议")
+        ic_trend_table = program_metrics.get("_ic_trend_table", "")
+
+        # 知识库检索：如果未外部传入且设置了回调，自动调用检索
+        if not knowledge_base_context and self._knowledge_retriever_callback:
+            try:
+                knowledge_base_context = self._knowledge_retriever_callback(
+                    current_program, program_metrics
+                )
+                if knowledge_base_context:
+                    logger.info(
+                        f"[KB] Retrieved knowledge for round {evolution_round}: "
+                        f"{knowledge_base_context[:300]}..."
+                    )
+            except Exception as e:
+                logger.warning(f"Knowledge retrieval failed: {e}")
+                knowledge_base_context = ""
+
+        # Build competition context (top programs comparison)
+        competition_context = self._build_competition_context(top_programs, program_metrics)
+
         # Format the final user message
         user_message = user_template.format(
             metrics=metrics_str,
@@ -145,6 +228,21 @@ class PromptSampler:
             current_program=current_program,
             language=language,
             artifacts=artifacts_section,
+            # ═══ 因子评估专用字段 ═══
+            train_ic_current=f"{train_ic_current:+.4f}",
+            train_ic_status=ic_status(train_ic_current),
+            train_ir_current=f"{train_ir_current:.3f}",
+            train_ir_status=ir_status(train_ir_current),
+            val_ic_current=f"{val_ic_current:+.4f}",
+            val_ic_status=ic_status(val_ic_current),
+            val_ir_current=f"{val_ir_current:.3f}",
+            val_ir_status=ir_status(val_ir_current),
+            score_status=score_status(fitness_score),
+            diagnostics_prio=diagnostics_prio,
+            parameter_suggestions=parameter_suggestions,
+            ic_trend_table=ic_trend_table,
+            knowledge_base_context=knowledge_base_context,
+            competition_context=competition_context,
             **kwargs,
         )
 
@@ -224,6 +322,53 @@ class PromptSampler:
             improvement_areas.append(self.template_manager.get_fragment("no_specific_guidance"))
 
         return "\n".join(f"- {area}" for area in improvement_areas)
+
+    def _build_competition_context(
+        self,
+        top_programs: List[Dict[str, Any]],
+        current_metrics: Dict[str, float],
+    ) -> str:
+        """Build competition context showing what the LLM needs to beat"""
+        if not top_programs:
+            return ""
+
+        best = top_programs[0]
+        best_metrics = best.get("metrics", {})
+        best_score = best_metrics.get(
+            "combined_score", get_fitness_score(best_metrics, [])
+        )
+        current_score = current_metrics.get(
+            "combined_score", get_fitness_score(current_metrics, [])
+        )
+
+        if best_score <= 0:
+            return ""
+
+        gap = best_score - current_score
+
+        lines = []
+        lines.append(f"**全局最优 combined_score**: {best_score:.4f}")
+
+        if gap > 0.001:
+            lines.append(f"**当前因子 combined_score**: {current_score:.4f}")
+            lines.append(f"**需要超越的差距**: {gap:.4f} (相对 {gap / best_score * 100:.1f}%)")
+        else:
+            lines.append("**当前因子已是全局最优** — 尝试进一步突破")
+
+        lines.append("")
+        lines.append("**Top-3 因子关键指标**:")
+        for i, prog in enumerate(top_programs[:3]):
+            m = prog.get("metrics", {})
+            score = m.get("combined_score", get_fitness_score(m, []))
+            ic = m.get("train_rank_ic_mean", 0)
+            ir = m.get("train_rank_ic_ir", 0)
+            val_ic = m.get("val_rank_ic_mean", 0)
+            lines.append(
+                f"  {i + 1}. score={score:.3f}, "
+                f"IC={ic:+.4f}, IR={ir:.3f}, val_IC={val_ic:+.4f}"
+            )
+
+        return "\n".join(lines)
 
     def _format_evolution_history(
         self,

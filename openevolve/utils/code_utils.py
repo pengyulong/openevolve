@@ -2,8 +2,62 @@
 Utilities for code parsing, diffing, and manipulation
 """
 
+import difflib
 import re
 from typing import Dict, List, Optional, Tuple, Union
+
+
+def extract_outer_code(code: str) -> Optional[Tuple[str, str]]:
+    """
+    提取 EVOLVE-BLOCK 之外的前缀和后缀代码（如 imports、辅助函数等）
+
+    Args:
+        code: 包含 EVOLVE-BLOCK 标记的完整源代码
+
+    Returns:
+        (header, footer) 元组，header 是 EVOLVE-BLOCK-START 之前的内容，
+        footer 是 EVOLVE-BLOCK-END 之后的内容。
+        如果没有找到标记则返回 None
+    """
+    start_marker = "# EVOLVE-BLOCK-START"
+    end_marker = "# EVOLVE-BLOCK-END"
+
+    start_idx = code.find(start_marker)
+    end_idx = code.find(end_marker)
+
+    if start_idx == -1:
+        return None
+
+    header = code[:start_idx]
+    if end_idx != -1:
+        footer = code[end_idx + len(end_marker):]
+    else:
+        footer = ""
+
+    return header, footer
+
+
+def wrap_full_rewrite(parent_code: str, child_code: str) -> str:
+    """
+    用父程序的 outer code（imports、辅助函数等）包裹子程序的 EVOLVE-BLOCK 代码
+
+    在 full_rewrite 模式下，LLM 只输出 EVOLVE-BLOCK 内容，需要重新包裹
+    外层代码（imports 等）以确保代码可以独立运行。
+
+    Args:
+        parent_code: 父程序的完整源代码（含 imports 等外层代码）
+        child_code: 子程序的代码（LLM 在 full_rewrite 模式下的输出）
+
+    Returns:
+        完整的、可运行的子程序代码
+    """
+    outer = extract_outer_code(parent_code)
+    if outer is None:
+        # 父程序没有 EVOLVE-BLOCK 标记，直接返回子程序代码
+        return child_code
+
+    header, footer = outer
+    return header + child_code + footer
 
 
 def parse_evolve_blocks(code: str) -> List[Tuple[int, int, str]]:
@@ -142,6 +196,51 @@ def format_diff_summary(diff_blocks: List[Tuple[str, str]]) -> str:
             summary.append(f"Change {i+1}: Replace {search_summary} with {replace_summary}")
 
     return "\n".join(summary)
+
+
+def compute_unified_diff(original_code: str, new_code: str) -> str:
+    """
+    Compute a unified diff summary between original and new code.
+
+    Args:
+        original_code: The parent/original source code
+        new_code: The child/new source code
+
+    Returns:
+        A human-readable diff summary string
+    """
+    if original_code == new_code:
+        return "No changes"
+
+    original_lines = original_code.splitlines(keepends=True)
+    new_lines = new_code.splitlines(keepends=True)
+
+    diff_lines = list(
+        difflib.unified_diff(
+            original_lines,
+            new_lines,
+            fromfile="parent",
+            tofile="child",
+            lineterm="",
+        )
+    )
+
+    if not diff_lines:
+        return "No changes"
+
+    # Count additions and deletions
+    additions = sum(1 for line in diff_lines if line.startswith("+") and not line.startswith("+++"))
+    deletions = sum(1 for line in diff_lines if line.startswith("-") and not line.startswith("---"))
+
+    summary = f"{additions} line(s) added, {deletions} line(s) deleted"
+
+    # Include the actual diff (truncate if too long)
+    full_diff = "\n".join(diff_lines)
+    max_length = 2000
+    if len(full_diff) > max_length:
+        full_diff = full_diff[:max_length] + "\n... (truncated)"
+
+    return f"{summary}\n{full_diff}"
 
 
 def calculate_edit_distance(code1: str, code2: str) -> int:

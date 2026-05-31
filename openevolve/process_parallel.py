@@ -27,6 +27,11 @@ _worker_llm_ensemble = None
 _worker_prompt_sampler = None
 _worker_kb_config: Optional[dict] = None
 _worker_knowledge_writer = None
+_worker_knowledge_retriever = None
+_worker_expert_advisor = None
+_worker_expert_last_run: int = 0
+_worker_stagnation_counter: int = 0
+_worker_best_score_seen: float = 0.0
 
 
 @dataclass
@@ -114,6 +119,10 @@ def _worker_init(config_dict: dict, evaluation_file: str, parent_env: dict = Non
     if _worker_kb_config:
         logger.info(f"KB config loaded in worker init: enabled={_worker_kb_config.get('enabled')}, module_dir={_worker_kb_config.get('module_dir')}")
         logger.info(f"KB config received (enabled={_worker_kb_config.get('enabled')})")
+        # Attach expert_advisor config for embedded trigger mode
+        expert_cfg = config_dict.get("expert_advisor")
+        if expert_cfg and expert_cfg.get("enabled", False):
+            _worker_kb_config["_expert_advisor_config"] = expert_cfg
     else:
         logger.warning(f"No KB config in config_dict keys={list(config_dict.keys())}")
 
@@ -247,6 +256,10 @@ def _init_worker_kb_retriever():
 
         _worker_prompt_sampler.set_knowledge_retriever(retrieval_callback)
 
+        # Store retriever for feedback calls
+        global _worker_knowledge_retriever
+        _worker_knowledge_retriever = retriever
+
         # Initialize KnowledgeWriter for writeback
         global _worker_knowledge_writer
         try:
@@ -298,6 +311,104 @@ def _init_worker_kb_retriever():
         logger.warning(traceback.format_exc())
 
 
+def _maybe_trigger_expert_advisor(iteration: int, child_score: float):
+    """Trigger Expert Advisor when evolution stagnates."""
+    global _worker_expert_advisor, _worker_expert_last_run
+    global _worker_stagnation_counter, _worker_best_score_seen
+    global _worker_kb_config, _worker_knowledge_retriever
+
+    if _worker_kb_config is None:
+        return
+
+    expert_config = _worker_kb_config.get("_expert_advisor_config")
+    if not expert_config or not expert_config.get("enabled", False):
+        return
+
+    trigger_mode = expert_config.get("trigger_mode", "standalone")
+    if trigger_mode == "standalone":
+        return
+
+    trigger_conditions = expert_config.get("trigger_conditions", {})
+    stagnation_threshold = trigger_conditions.get("stagnation_rounds", 20)
+    max_frequency = trigger_conditions.get("max_frequency", 50)
+
+    # Track stagnation
+    if child_score > _worker_best_score_seen:
+        _worker_best_score_seen = child_score
+        _worker_stagnation_counter = 0
+    else:
+        _worker_stagnation_counter += 1
+
+    # Check trigger conditions
+    should_trigger = (
+        _worker_stagnation_counter >= stagnation_threshold
+        and (iteration - _worker_expert_last_run) >= max_frequency
+    )
+
+    if not should_trigger:
+        return
+
+    try:
+        if _worker_expert_advisor is None:
+            _worker_expert_advisor = _init_expert_advisor(expert_config)
+
+        if _worker_expert_advisor is None:
+            return
+
+        context = {
+            "best_score": _worker_best_score_seen,
+            "stagnation_rounds": _worker_stagnation_counter,
+            "current_iteration": iteration,
+            "best_program_code": "",
+            "factor_categories": {},
+            "kb_stats": _worker_knowledge_retriever.kb.get_stats() if _worker_knowledge_retriever else {},
+        }
+
+        entries = _worker_expert_advisor.run(context)
+        _worker_expert_last_run = iteration
+        _worker_stagnation_counter = 0
+
+        if entries:
+            logger.info(
+                f"Iteration {iteration}: Expert Advisor injected {len(entries)} "
+                f"knowledge entries (stagnation was {stagnation_threshold}+ rounds)"
+            )
+
+    except Exception as e:
+        logger.debug(f"Expert Advisor trigger failed (non-critical): {e}")
+
+
+def _init_expert_advisor(expert_config: dict):
+    """Lazily initialize Expert Advisor instance in worker."""
+    global _worker_knowledge_retriever
+
+    if _worker_knowledge_retriever is None:
+        return None
+
+    try:
+        import sys
+        import os
+
+        module_dir = _worker_kb_config.get("module_dir", "")
+        if module_dir and os.path.isdir(module_dir):
+            parent_dir = os.path.dirname(os.path.abspath(module_dir))
+            if parent_dir not in sys.path:
+                sys.path.insert(0, parent_dir)
+
+        from knowledge_base.kb_expert import ExpertAdvisor
+
+        advisor = ExpertAdvisor(
+            config=expert_config,
+            kb=_worker_knowledge_retriever.kb,
+            embedder=_worker_knowledge_retriever.embedder if hasattr(_worker_knowledge_retriever, 'embedder') else None,
+        )
+        return advisor
+
+    except Exception as e:
+        logger.warning(f"Failed to initialize Expert Advisor: {e}")
+        return None
+
+
 def _run_iteration_worker(
     iteration: int, db_snapshot: Dict[str, Any], parent_id: str, inspiration_ids: List[str]
 ) -> SerializableResult:
@@ -335,6 +446,24 @@ def _run_iteration_worker(
         # Best programs only (for previous attempts section, focused on top performers)
         best_programs_only = island_programs[: _worker_config.prompt.num_top_programs]
 
+        # Determine if this iteration should use exploration template
+        exploration_interval = getattr(_worker_config, 'exploration_interval', 0)
+        use_exploration = (
+            exploration_interval > 0
+            and iteration > 0
+            and (iteration % exploration_interval == 0)
+        )
+        template_key = "exploration_user" if use_exploration else None
+
+        if use_exploration:
+            logger.info(f"Iteration {iteration}: Using exploration template (forced creative mutation)")
+
+        # Issue-6: Island differentiation — inject per-island exploration hint
+        island_hints = getattr(_worker_config, 'island_hints', [])
+        island_hint = ""
+        if island_hints and parent_island < len(island_hints):
+            island_hint = island_hints[parent_island]
+
         # Build prompt
         prompt = _worker_prompt_sampler.build_prompt(
             current_program=parent.code,
@@ -348,6 +477,8 @@ def _run_iteration_worker(
             diff_based_evolution=_worker_config.diff_based_evolution,
             program_artifacts=parent_artifacts,
             feature_dimensions=db_snapshot.get("feature_dimensions", []),
+            template_key=template_key,
+            island_hint=island_hint,
         )
 
         iteration_start = time.time()
@@ -426,40 +557,83 @@ def _run_iteration_worker(
 
         iteration_time = time.time() - iteration_start
 
-        # Knowledge writeback: detect significant improvements > writeback threshold
+        # Knowledge writeback and feedback: detect improvements and track knowledge effectiveness
         try:
-            if _worker_knowledge_writer is not None:
-                parent_score = parent.metrics.get("combined_score", 0)
-                child_score = child_metrics.get("combined_score", 0)
-                if parent_score > 0 and child_score > 0:
-                    improvement_pct = (child_score - parent_score) / parent_score
-                    writeback_threshold = _worker_kb_config.get("writeback_threshold", 0.15)
-                    if improvement_pct > writeback_threshold:
-                        # Extract problem codes from parent diagnostics
-                        parent_diag = parent.metrics.get("_diagnostics_raw", {})
-                        problem_codes = []
-                        if isinstance(parent_diag, dict):
-                            for issue in parent_diag.get("priority_issues", []):
-                                code = issue.get("code", "")
-                                if code and code != "ALL_GOOD":
-                                    problem_codes.append(code)
+            parent_score = parent.metrics.get("combined_score", 0)
+            child_score = child_metrics.get("combined_score", 0)
+            improvement_pct = (
+                (child_score - parent_score) / parent_score if parent_score > 0 else 0
+            )
 
-                        kb_id = _worker_knowledge_writer.writeback(
-                            parent_code=parent.code,
-                            child_code=child_code,
-                            parent_metrics=parent.metrics,
-                            child_metrics=child_metrics,
-                            problem_codes=problem_codes,
+            # Writeback: when improvement exceeds threshold (relative OR absolute)
+            if _worker_knowledge_writer is not None and improvement_pct > 0:
+                writeback_threshold = _worker_kb_config.get("writeback_threshold", 0.05)
+                writeback_abs_threshold = _worker_kb_config.get("writeback_abs_threshold", 0.03)
+                abs_improvement = child_score - parent_score
+
+                should_writeback = (
+                    improvement_pct > writeback_threshold
+                    or abs_improvement > writeback_abs_threshold
+                )
+                if should_writeback:
+                    # Extract problem codes from parent diagnostics
+                    parent_diag = parent.metrics.get("_diagnostics_raw", {})
+                    problem_codes = []
+                    if isinstance(parent_diag, dict):
+                        for issue in parent_diag.get("priority_issues", []):
+                            code = issue.get("code", "")
+                            if code and code != "ALL_GOOD":
+                                problem_codes.append(code)
+
+                    kb_id = _worker_knowledge_writer.writeback(
+                        parent_code=parent.code,
+                        child_code=child_code,
+                        parent_metrics=parent.metrics,
+                        child_metrics=child_metrics,
+                        problem_codes=problem_codes,
+                    )
+                    if kb_id:
+                        logger.info(
+                            f"Iteration {iteration}: Knowledge writeback triggered "
+                            f"(improvement: +{improvement_pct:.1%}, "
+                            f"score: {parent_score:.3f}→{child_score:.3f}, "
+                            f"entry={kb_id})"
                         )
-                        if kb_id:
-                            logger.info(
-                                f"Iteration {iteration}: Knowledge writeback triggered "
-                                f"(improvement: +{improvement_pct:.1%}, "
-                                f"score: {parent_score:.3f}→{child_score:.3f}, "
-                                f"entry={kb_id})"
-                            )
+
+            # Feedback: track whether retrieved knowledge led to improvement
+            # Use a lower threshold for feedback (any positive improvement counts)
+            if _worker_knowledge_retriever is not None:
+                feedback_threshold = _worker_kb_config.get("feedback_threshold", 0.0)
+                improved = improvement_pct > feedback_threshold
+                _worker_knowledge_retriever.feedback(improved, improvement_pct)
+
+            # Periodic knowledge pruning (every 50 iterations, check for stale entries)
+            if (_worker_knowledge_retriever is not None
+                    and _worker_kb_config.get("pruning_enabled", True)
+                    and iteration > 0
+                    and iteration % 50 == 0):
+                try:
+                    min_retrievals = _worker_kb_config.get("pruning_min_retrievals", 3)
+                    max_failures = _worker_kb_config.get("pruning_max_consecutive_failures", 5)
+                    min_quality = _worker_kb_config.get("pruning_min_quality_score", 0.1)
+                    pruned = _worker_knowledge_retriever.kb.prune_stale_knowledge(
+                        min_retrievals=min_retrievals,
+                        max_consecutive_failures=max_failures,
+                        min_quality_score=min_quality,
+                        dry_run=False,
+                    )
+                    if pruned:
+                        logger.info(
+                            f"Iteration {iteration}: Auto-pruned {len(pruned)} stale "
+                            f"knowledge entries: {[p['entry_id'] for p in pruned]}"
+                        )
+                except Exception as e:
+                    logger.debug(f"Periodic pruning skipped (non-critical): {e}")
+
+            # Expert Advisor: inject external knowledge when evolution stagnates
+            _maybe_trigger_expert_advisor(iteration, child_score)
         except Exception as e:
-            logger.warning(f"Knowledge writeback failed non-critically: {e}")
+            logger.warning(f"Knowledge writeback/feedback failed non-critically: {e}")
 
         return SerializableResult(
             child_program_dict=child_program.to_dict(),
@@ -529,6 +703,7 @@ class ProcessParallelController:
             "language": config.language,
             "file_suffix": self.file_suffix,
             "knowledge_base": config.knowledge_base,
+            "expert_advisor": config.expert_advisor,
         }
 
     def start(self) -> None:

@@ -12,6 +12,7 @@ from openevolve.llm.ensemble import LLMEnsemble
 from openevolve.prompt.sampler import PromptSampler
 from openevolve.utils.code_utils import (
     apply_diff,
+    compute_unified_diff,
     extract_diffs,
     format_diff_summary,
     parse_full_rewrite,
@@ -58,6 +59,12 @@ async def run_iteration_with_shared_db(
         island_top_programs = database.get_top_programs(5, island_idx=parent_island)
         island_previous_programs = database.get_top_programs(3, island_idx=parent_island)
 
+        # Issue-6: Island differentiation — inject exploration direction hint per island
+        island_hints = config.island_hints
+        island_hint = ""
+        if island_hints and parent_island < len(island_hints):
+            island_hint = island_hints[parent_island]
+
         # Build prompt
         prompt = prompt_sampler.build_prompt(
             current_program=parent.code,
@@ -71,6 +78,7 @@ async def run_iteration_with_shared_db(
             diff_based_evolution=config.diff_based_evolution,
             program_artifacts=parent_artifacts if parent_artifacts else None,
             feature_dimensions=database.config.feature_dimensions,
+            island_hint=island_hint,
         )
 
         result = Result(parent=parent)
@@ -101,8 +109,10 @@ async def run_iteration_with_shared_db(
                 logger.warning(f"Iteration {iteration+1}: No valid code found in response")
                 return None
 
-            child_code = new_code
-            changes_summary = "Full rewrite"
+            from openevolve.utils.code_utils import wrap_full_rewrite
+
+            child_code = wrap_full_rewrite(parent.code, new_code)
+            changes_summary = compute_unified_diff(parent.code, child_code)
 
         # Check code length
         if len(child_code) > config.max_code_length:
