@@ -79,6 +79,11 @@ class KnowledgeBaseConfig:
     rule_filter_min_candidates: int = 10
     writeback_threshold: float = 0.15
     writeback_use_llm: bool = True
+    feedback_threshold: float = 0.0
+    pruning_enabled: bool = True
+    pruning_min_retrievals: int = 3
+    pruning_max_consecutive_failures: int = 5
+    pruning_min_quality_score: float = 0.1
 
 
 @dataclass
@@ -180,6 +185,11 @@ class Config:
             rule_filter_min_candidates=int(kb_raw.get("rule_filter_min_candidates", 10)),
             writeback_threshold=float(kb_raw.get("writeback_threshold", 0.15)),
             writeback_use_llm=bool(kb_raw.get("writeback_use_llm", True)),
+            feedback_threshold=float(kb_raw.get("feedback_threshold", 0.0)),
+            pruning_enabled=bool(kb_raw.get("pruning_enabled", True)),
+            pruning_min_retrievals=int(kb_raw.get("pruning_min_retrievals", 3)),
+            pruning_max_consecutive_failures=int(kb_raw.get("pruning_max_consecutive_failures", 5)),
+            pruning_min_quality_score=float(kb_raw.get("pruning_min_quality_score", 0.1)),
         )
 
         # 解析 evolution 部分

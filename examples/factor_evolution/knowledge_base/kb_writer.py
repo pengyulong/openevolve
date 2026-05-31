@@ -22,7 +22,7 @@ class KnowledgeWriter:
     """
     知识回写器
 
-    触发条件：子代 combined_score 比父代提升超过阈值
+    触发条件：子代 combined_score 比父代提升超过阈值（相对或绝对）
     处理流程：
     1. 提取父代问题、子代改进内容
     2. 用轻量 LLM 总结改进经验
@@ -34,7 +34,8 @@ class KnowledgeWriter:
         self,
         kb: KnowledgeBase,
         embedder: KBEmbedder,
-        writeback_threshold: float = 0.15,
+        writeback_threshold: float = 0.05,
+        writeback_abs_threshold: float = 0.03,
         use_llm_summary: bool = True,
         llm_client: Optional[Any] = None,
     ):
@@ -42,13 +43,15 @@ class KnowledgeWriter:
         Args:
             kb: 知识库实例
             embedder: 嵌入向量生成器
-            writeback_threshold: 回写阈值（combined_score 相对提升比例）
+            writeback_threshold: 相对提升阈值
+            writeback_abs_threshold: 绝对提升阈值
             use_llm_summary: 是否使用 LLM 总结改进经验
             llm_client: LLM 客户端（OpenAI 兼容接口）
         """
         self.kb = kb
         self.embedder = embedder
         self.writeback_threshold = writeback_threshold
+        self.writeback_abs_threshold = writeback_abs_threshold
         self.use_llm_summary = use_llm_summary
         self.llm_client = llm_client
 
@@ -60,21 +63,23 @@ class KnowledgeWriter:
         """
         判断是否应该触发知识回写
 
-        Args:
-            parent_metrics: 父代指标
-            child_metrics: 子代指标
-
-        Returns:
-            是否触发回写
+        触发条件（满足任一即可）：
+        1. 相对提升超过 writeback_threshold
+        2. 绝对提升超过 writeback_abs_threshold（适用于高分区）
         """
         parent_score = parent_metrics.get("combined_score", 0)
         child_score = child_metrics.get("combined_score", 0)
 
-        if parent_score <= 0 or child_score <= 0:
+        if parent_score <= 0 or child_score <= parent_score:
             return False
 
-        improvement = (child_score - parent_score) / parent_score
-        return improvement > self.writeback_threshold
+        relative_improvement = (child_score - parent_score) / parent_score
+        absolute_improvement = child_score - parent_score
+
+        return (
+            relative_improvement > self.writeback_threshold
+            or absolute_improvement > self.writeback_abs_threshold
+        )
 
     def extract_knowledge(
         self,
@@ -126,7 +131,7 @@ class KnowledgeWriter:
         problem_codes: list,
         improvement_ratio: float,
     ) -> Dict[str, Any]:
-        """用模板方式提取知识（不需要 LLM）"""
+        """用模板方式提取知识（不需要 LLM），支持分级回写"""
         parent_ic = parent_metrics.get("train_rank_ic_mean", 0)
         child_ic = child_metrics.get("train_rank_ic_mean", 0)
         parent_ir = parent_metrics.get("train_rank_ic_ir", 0)
@@ -134,19 +139,28 @@ class KnowledgeWriter:
         parent_val_ic = parent_metrics.get("val_rank_ic_mean", 0)
         child_val_ic = child_metrics.get("val_rank_ic_mean", 0)
 
-        # 检测因子类别
         factor_category = self._detect_category(child_code)
+        abs_improvement = child_metrics.get("combined_score", 0) - parent_metrics.get("combined_score", 0)
 
-        # 提取代码差异的关键行
-        child_diff = self._extract_significant_lines(parent_code, child_code)
+        # 分级回写：大幅提升写完整案例，小幅提升写简要 tips
+        is_major = improvement_ratio >= 0.10 or abs_improvement >= 0.05
 
-        # 构建知识内容
         context_before = (
             f"因子train_IC={parent_ic:+.4f}, val_IC={parent_val_ic:+.4f}, "
             f"IR={parent_ir:.3f}, combined_score={parent_metrics.get('combined_score', 0):.3f}"
         )
 
-        improvement_action = f"修改因子计算逻辑，新增/调整以下关键部分：\n{child_diff}"
+        if is_major:
+            child_diff = self._extract_significant_lines(parent_code, child_code)
+            improvement_action = f"修改因子计算逻辑，新增/调整以下关键部分：\n{child_diff}"
+            code_example = self._extract_evolve_block(child_code)
+        else:
+            improvement_action = (
+                f"微调因子逻辑，"
+                f"train_IC {parent_ic:+.4f}→{child_ic:+.4f}, "
+                f"IR {parent_ir:.3f}→{child_ir:.3f}"
+            )
+            code_example = ""
 
         improvement_result = (
             f"combined_score {parent_metrics.get('combined_score', 0):.3f} → "
@@ -157,13 +171,8 @@ class KnowledgeWriter:
             f"val_IC: {parent_val_ic:+.4f}→{child_val_ic:+.4f}"
         )
 
-        # 提取 EVOLVE-BLOCK 中的代码作为示例
-        code_example = self._extract_evolve_block(child_code)
-
-        # 构建标签
         tags = list(set(self._extract_tags(child_code) + problem_codes))
 
-        # 构建搜索文本
         search_text = (
             f"{' '.join(problem_codes)} {factor_category} {context_before} "
             f"{improvement_action} {improvement_result} {' '.join(tags)}"

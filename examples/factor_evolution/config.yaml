@@ -14,17 +14,28 @@ train_end_date: "20231231"     # 训练集截止日（2024年为验证集）
 language: python
 
 # 最大代码长度
-max_code_length: 4000
+max_code_length: 8192
+
+# 探索性变异：每10次迭代强制使用探索性prompt模板
+exploration_interval: 10
+
+# Issue-6: 岛屿分化策略 — 每个岛屿有不同的探索方向提示
+# 8个岛屿对应8个差异化探索方向，促进因子多样性
+island_hints:
+  - "【岛屿方向：价值类因子】优先探索 BP/EP/股息率/FCF 等基本面价值因子及其变体。"
+  - "【岛屿方向：动量与反转】优先探索短期反转、中期动量、成交量确认等趋势信号因子。"
+  - "【岛屿方向：波动率因子】优先探索特质波动率、下行波动率、波动率变化率等风险类因子。"
+  - "【岛屿方向：量价交互】优先探索量价背离、OBV变体、价量相关性、智能资金指标等因子。"
+  - "【岛屿方向：非线性复合】优先探索因子交互项、条件因子、分位数交互等非线性组合方式。"
+  - "【岛屿方向：高阶统计量】优先探索偏度、峰度、尾部风险、上下行波动率之比等高阶矩因子。"
+  - "【岛屿方向：流动性与微结构】优先探索换手率变化、买卖价差、大单比例、资金流向等微结构因子。"
+  - "【岛屿方向：自由探索】不限定方向，大胆尝试全新逻辑，可结合事件驱动、regime切换、基本面动量等。"
 
 # LLM 配置 (DeepSeek)
 llm:
   models:
     - name: "deepseek-v4-flash"
-      weight: 0.7
-      api_key: "${LLM_API_KEY}"
-      api_base: "${LLM_API_BASE}"
-    - name: "deepseek-v4-pro"
-      weight: 0.3
+      weight: 1.0
       api_key: "${LLM_API_KEY}"
       api_base: "${LLM_API_BASE}"
   temperature: 0.8
@@ -36,7 +47,7 @@ llm:
 database:
   population_size: 100          # 总种群大小
   num_islands: 8                # 5个岛屿并行进化
-  migration_interval: 30        # 每30代迁移一次
+  migration_interval: 50        # 每50代迁移一次（延长以保持岛屿分化）
   exploration_ratio: 0.3        # 探索比例（随机采样）
   exploitation_ratio: 0.4       # 开发比例（从最优附近采样）
 
@@ -46,13 +57,13 @@ database:
     - "abs_ic_mean"             # |IC均值| - 预测能力
     - "ic_ir"                   # |IC信息比| - 稳定性
     - "ic_stability"            # IC胜率 - 方向一致性
-    - "factor_turnover"         # 因子换手率 - 交易成本
+    - "factor_type_code"        # 因子结构类型 - 促进多样性探索
   feature_bins: 5               # 每个维度5个分箱
 
 # 评估器配置
 evaluator:
   timeout: 300                  # 单次评估超时（秒）
-  parallel_evaluations: 2       # 并行评估数
+  parallel_evaluations: 1       # 并行评估数（单worker避免API限流）
   cascade_evaluation: false     # 使用直接评估模式（非级联）
 
 # 提示配置 - 使用自定义模板
@@ -83,12 +94,61 @@ knowledge_base:
   rule_filter_min_candidates: 10    # 规则过滤最小候选数
 
   # 回写配置
-  writeback_threshold: 0.15         # combined_score提升超过15%才回写
-  use_llm_summary: true             # 使用轻量LLM总结改进经验
+  writeback_threshold: 0.05          # combined_score相对提升超过5%即回写
+  writeback_abs_threshold: 0.03      # 或绝对提升超过0.03即回写（适用高分区）
+  use_llm_summary: true              # 使用轻量LLM总结改进经验
 
   # Embedding配置（用于向量相似度检索）
   # 优先使用本地 embedding server，不可用时 fallback 到 OpenAI 兼容 API
-  embedding_local_url: "${EMBEDDING_LOCAL_URL}"  # 本地向量服务，如 http://localhost:8190/llm_service/embedding
+  embedding_local_url: "http://10.153.108.18:8190/llm_service/embedding"
   embedding_model: "local-bge"      # 本地服务标识（维度自动检测）
-  embedding_dim: 2048               # 嵌入向量维度（本地服务会自动检测并更新）
+  embedding_dim: 768                # 嵌入向量维度（本地服务实际返回768维）
   # embedding_api_key 和 embedding_base_url 仅在本地服务不可用时使用
+
+  # 知识反馈与修剪配置（追踪召回→改进关联，自动淘汰无效知识）
+  feedback_threshold: 0.0            # 多小的改进算"有增益"（0=任何正向改进都算）
+  pruning_enabled: true              # 是否启用自动修剪
+  pruning_min_retrievals: 3          # 最少被召回次数（不足不评估）
+  pruning_max_consecutive_failures: 5 # 连续无增益次数上限（超过则标记deprecated）
+  pruning_min_quality_score: 0.1     # 最低质量评分（低于此值才会被修剪）
+
+# ═══ Expert Advisor 配置 ═══
+# 专家 LLM 知识注入：通过外部搜索获取新知识，打破演化局部最优
+expert_advisor:
+  enabled: true
+  trigger_mode: "both"               # standalone / embedded / both
+
+  # Expert LLM 配置（模型名/URL/token 后续填入）
+  llm:
+    model: "gpt-5.5"
+    api_key: "sk-Y7WaF5QEbbDSEwuvC95b5c9d7e3a4a2dBb8790500907073c"
+    api_base: "https://oneapi-comate.baidu-int.com/v1"
+    temperature: 0.7
+    max_tokens: 4096
+
+  # 嵌入模式触发条件
+  trigger_conditions:
+    stagnation_rounds: 20            # 连续N轮无改进时触发
+    after_pruning: true              # 每次知识修剪后触发
+    max_frequency: 50                # 最多每50轮触发一次
+
+  # 搜索工具配置
+  tools:
+    market_regime:
+      enabled: true
+    academic_paper:
+      enabled: true
+      max_results: 5
+    web_search:
+      enabled: true
+      max_results: 3
+    tushare_factor:
+      enabled: true
+
+  # 缓存配置
+  cache:
+    db_path: "./knowledge_base/expert_cache.db"
+    ttl_seconds: 604800              # 7天缓存
+
+  # 每次注入的最大知识条目数
+  max_entries_per_run: 5

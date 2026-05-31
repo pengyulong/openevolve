@@ -16,6 +16,8 @@
 import os
 import sys
 import importlib.util
+import inspect
+import re
 import traceback
 import logging
 import pickle
@@ -56,6 +58,13 @@ class CrossSectionalICEvaluator:
 
         # 上一次评估的指标（用于计算趋势）
         self._prev_metrics: Optional[Dict[str, float]] = None
+
+        # P0-1: 代码历史 — 用于同质化检测
+        self._code_history: List[str] = []  # 存储已评估因子的归一化代码
+        self._max_code_history: int = 50   # 最多保留 50 个历史代码
+
+        # P0-2: 市场状态检测所需数据
+        self._market_volatility: float = 0.0  # 最近的市场波动率
 
     def _build_forward_returns(self) -> pd.DataFrame:
         """构建未来 N 日收益率截面矩阵 (date x stock)"""
@@ -203,8 +212,63 @@ class CrossSectionalICEvaluator:
         train_metrics = self._calc_ic_stats(train_ic, train_pearson, prefix="train")
         val_metrics = self._calc_ic_stats(val_ic, val_pearson, prefix="val")
 
-        # 5. 综合评分
-        combined_score = self._calc_combined_score(train_metrics, val_metrics)
+        # 5. 市场状态检测 → 动态权重调整系数
+        self._regime_mod = self._detect_market_regime(train_ic, val_ic)
+
+        # 6. 综合评分（含动态权重 + 同质化惩罚）
+        # 获取源码并检测同质化
+        try:
+            factor_code = inspect.getsource(compute_func)
+        except Exception:
+            factor_code = ""
+        code_similarity = self._calc_code_similarity(factor_code)
+        self._add_to_code_history(factor_code)
+
+        combined_score = self._calc_combined_score(
+            train_metrics, val_metrics, code_similarity
+        )
+
+        # ═══ Issue-4: 按季度IC分布分析 ═══
+        quarterly_ic_train = self._calc_quarterly_ic_breakdown(train_ic)
+        quarterly_ic_val = self._calc_quarterly_ic_breakdown(val_ic)
+        worst_q_ic = self._calc_worst_quarter_ic(ic_series)  # 全时段最差季度
+
+        # ═══ 高分区额外奖励：鼓励稳定性和单调性 ═══
+        if combined_score > 0.5:
+            bonus = 0.0
+            # 最差季度 IC 奖励
+            train_worst_q = self._calc_worst_quarter_ic(train_ic)
+            if train_worst_q > 0.02:
+                bonus += 0.03
+            elif train_worst_q > 0.01:
+                bonus += 0.015
+            # 分组单调性奖励
+            monotonicity = self._calc_monotonicity(factor_panel, self.forward_returns)
+            if monotonicity > 0.7:
+                bonus += 0.03
+            elif monotonicity > 0.5:
+                bonus += 0.015
+            combined_score = min(combined_score + bonus, 1.0)
+
+        # ═══ Issue-4: 最差季度IC惩罚（全时段，包括验证集） ═══
+        if worst_q_ic < -0.02:
+            combined_score -= 0.04
+        elif worst_q_ic < 0:
+            combined_score -= 0.02
+        combined_score = max(combined_score, 0.0)
+
+        # ═══ Issue-7: 经济学逻辑验证 ═══
+        size_group_stability = self._calc_size_group_ic_stability(
+            factor_panel, self.forward_returns
+        )
+        incremental_alpha = self._calc_incremental_alpha(
+            factor_panel, self.forward_returns
+        )
+
+        # 增量alpha奖励：如果残差IC高，说明因子提供独立预测能力
+        if combined_score > 0.3 and incremental_alpha > 0.03:
+            combined_score += min(0.03, incremental_alpha * 0.3)
+            combined_score = min(combined_score, 1.0)
 
         # ═══ 改进2：亲子截面相关性 ═══
         parent_corr = 0.0
@@ -224,6 +288,8 @@ class CrossSectionalICEvaluator:
         result["ic_count"] = len(ic_series)
         result["factor_coverage"] = valid_ratio
         result["auto_flipped"] = auto_flipped
+        result["code_similarity"] = code_similarity  # P0-1: 同质化程度
+        result["market_regime"] = self._regime_mod.get("regime", "normal")  # P0-2: 市场状态
 
         # IC方向标记（翻转后应始终为正或接近零）
         t_ic_raw = train_metrics.get("train_rank_ic_mean", 0)
@@ -234,11 +300,26 @@ class CrossSectionalICEvaluator:
         # 亲子相关性
         result["parent_corr"] = parent_corr
 
+        # Issue-4: 季度IC分布（诊断用）
+        result["worst_quarter_ic"] = worst_q_ic
+        result["quarterly_ic_train"] = quarterly_ic_train
+        result["quarterly_ic_val"] = quarterly_ic_val
+
+        # Issue-7: 经济学逻辑验证指标
+        result["size_group_stability"] = size_group_stability
+        result["incremental_alpha"] = incremental_alpha
+
         # MAP-Elites 特征维度
         result["abs_ic_mean"] = abs(train_metrics.get("train_rank_ic_mean", 0))
         result["ic_ir"] = abs(train_metrics.get("train_rank_ic_ir", 0))
         result["ic_stability"] = train_metrics.get("train_ic_win_rate", 0)
         result["factor_turnover"] = self._calc_factor_turnover(factor_panel)
+        try:
+            import inspect
+            source_code = inspect.getsource(compute_func)
+        except (OSError, TypeError):
+            source_code = ""
+        result["factor_type_code"] = self._calc_factor_type_code(source_code)
 
         # ═══ 改进3：结构化诊断反馈 ═══
         # 生成用于提示词的结构化诊断信息
@@ -623,18 +704,147 @@ class CrossSectionalICEvaluator:
             f"{prefix}_ic_count": int(len(rank_ic)),
         }
 
+    def _calc_code_similarity(self, code: str) -> float:
+        """
+        P0-1: 计算新因子代码与历史种群中最高相似度
+
+        使用关键字频率向量 + 归一化 n-gram 重叠度。
+        返回 0~1 之间的值，1 表示完全同质化。
+        """
+        if not code or len(self._code_history) == 0:
+            return 0.0
+
+        # 归一化：去注释、去空行、统一变量名风格
+        def normalize(c: str) -> str:
+            c = re.sub(r'#.*', '', c)          # 去注释
+            c = re.sub(r'\s+', ' ', c).strip() # 统一空白
+            return c
+
+        norm_code = normalize(code)
+        if len(norm_code) < 50:
+            return 0.0
+
+        # 提取关键字token（操作符、函数调用模式）
+        def extract_tokens(c: str) -> set:
+            # 提取标识符和操作符模式
+            tokens = set(re.findall(r'[a-zA-Z_]\w*|[+\-*/<>]=?|\.\w+', c))
+            return tokens
+
+        code_tokens = extract_tokens(norm_code)
+
+        max_similarity = 0.0
+        for hist_code in self._code_history[-20:]:  # 只和最接近的 20 个比
+            hist_tokens = extract_tokens(hist_code)
+            if not code_tokens or not hist_tokens:
+                continue
+            intersection = len(code_tokens & hist_tokens)
+            union = len(code_tokens | hist_tokens)
+            if union == 0:
+                continue
+            jaccard = intersection / union
+            max_similarity = max(max_similarity, jaccard)
+
+        return max_similarity
+
+    def _add_to_code_history(self, code: str) -> None:
+        """P0-1: 将归一化代码加入历史"""
+        if not code:
+            return
+        norm = re.sub(r'#.*', '', code)
+        norm = re.sub(r'\s+', ' ', norm).strip()
+        if len(norm) > 50:
+            self._code_history.append(norm)
+            if len(self._code_history) > self._max_code_history:
+                self._code_history = self._code_history[-self._max_code_history:]
+
+    def _detect_market_regime(self, train_ic, val_ic) -> Dict[str, float]:
+        """
+        P0-2: 检测市场状态，返回动态权重调整系数
+
+        根据 IC 序列的波动特征判断当前市场状态：
+        - high_vol: IC 波动大 → 重 IR（稳定性），轻 IC 均值
+        - low_vol:  IC 稳定 → 重 IC 均值，鼓励高信号
+        - trend:    训验 IC 一致 → 标准权重
+        - overfit:  训验 IC 背离 → 重验证集，惩罚过拟合
+        """
+        if len(train_ic) < 20:
+            return {"ic_weight": 1.0, "ir_weight": 1.0, "val_weight": 1.0, "regime": "normal"}
+
+        train_ic_vals = train_ic.dropna()
+        val_ic_vals = val_ic.dropna()
+
+        if len(train_ic_vals) < 20:
+            return {"ic_weight": 1.0, "ir_weight": 1.0, "val_weight": 1.0, "regime": "normal"}
+
+        # 计算 IC 波动率
+        ic_vol = train_ic_vals.std()
+        ic_mean = abs(train_ic_vals.mean())
+        ic_ir = ic_mean / ic_vol if ic_vol > 0 else 0
+
+        # 训练-验证一致性
+        if len(val_ic_vals) > 5:
+            train_val_corr = train_ic_vals[-len(val_ic_vals):].corr(
+                pd.Series(val_ic_vals.values, index=train_ic_vals.index[-len(val_ic_vals):])
+            ) if len(val_ic_vals) <= len(train_ic_vals) else 0
+        else:
+            train_val_corr = 0
+
+        regime = "normal"
+        ic_weight_mod = 1.0
+        ir_weight_mod = 1.0
+        val_weight_mod = 1.0
+
+        if ic_vol > 0.15:  # 高波动市场
+            regime = "high_vol"
+            ic_weight_mod = 0.7    # 降 IC 均值权重
+            ir_weight_mod = 1.4    # 升 IR 权重（稳定性更重要）
+            val_weight_mod = 1.2   # 升验证集权重
+        elif ic_ir > 0.8 and ic_vol < 0.08:  # 低波动高信号
+            regime = "low_vol_strong"
+            ic_weight_mod = 1.3    # 升 IC 权重（信号可靠）
+            val_weight_mod = 0.9
+        elif train_val_corr < -0.2:  # 训验背离
+            regime = "overfit_warning"
+            val_weight_mod = 1.5    # 重验证集
+            ic_weight_mod = 0.6     # 降训练集权重
+            ir_weight_mod = 0.8
+
+        self._market_volatility = ic_vol
+
+        return {
+            "ic_weight": ic_weight_mod,
+            "ir_weight": ir_weight_mod,
+            "val_weight": val_weight_mod,
+            "regime": regime,
+        }
+
+    @staticmethod
+    def _score_ic(ic: float) -> float:
+        """IC 评分：低分区线性，高分区对数拉伸"""
+        if ic <= 0.08:
+            return ic / 0.1
+        else:
+            import numpy as _np
+            return 0.8 + 0.2 * _np.log1p((ic - 0.08) / 0.04) / _np.log1p(3.0)
+
+    @staticmethod
+    def _score_ir(ir: float) -> float:
+        """IR 评分：低分区线性，高分区对数拉伸"""
+        if ir <= 1.5:
+            return ir / 2.0
+        else:
+            import numpy as _np
+            return 0.75 + 0.25 * _np.log1p((ir - 1.5) / 0.5) / _np.log1p(3.0)
+
     def _calc_combined_score(
-        self, train: Dict[str, float], val: Dict[str, float]
+        self, train: Dict[str, float], val: Dict[str, float],
+        code_similarity: float = 0.0,
     ) -> float:
         """
-        综合评分 v3：方向已由auto-flip保证为正，专注于IC强度+稳定性+泛化
+        综合评分 v4: 动态权重 + 同质化惩罚
 
-        分数 = 0.20 * train_IC / 0.1
-             + 0.25 * train_IR / 2.0
-             + 0.10 * train_win_rate
-             + 0.25 * val_IC / 0.1
-             + 0.20 * val_IR / 2.0
-             - direction_penalty (训练/验证不一致时)
+        P0-1: 代码相似度 > 0.75 时施加同质化惩罚（最多 -0.2）
+        P0-2: 根据 IC 序列特征动态调整 IC/IR/验证集权重
         """
         t_ic_raw = train.get("train_rank_ic_mean", 0)
         v_ic_raw = val.get("val_rank_ic_mean", 0)
@@ -644,23 +854,132 @@ class CrossSectionalICEvaluator:
         v_ic = abs(v_ic_raw)
         v_ir = abs(val.get("val_rank_ic_ir", 0))
 
+        # P0-2: 动态权重 — 默认权重 × 市场状态调整系数
+        # 默认权重通过环境变量或配置覆盖
+        default_weights = {
+            "train_ic": float(os.environ.get("EVAL_W_TRAIN_IC", "0.20")),
+            "train_ir": float(os.environ.get("EVAL_W_TRAIN_IR", "0.25")),
+            "train_wr": float(os.environ.get("EVAL_W_TRAIN_WR", "0.10")),
+            "val_ic":   float(os.environ.get("EVAL_W_VAL_IC", "0.25")),
+            "val_ir":   float(os.environ.get("EVAL_W_VAL_IR", "0.20")),
+        }
+
+        # 读取市场状态调整系数（由 evaluate_factor 事先设置）
+        regime_mod = getattr(self, '_regime_mod', None)
+        if regime_mod is None:
+            regime_mod = {"ic_weight": 1.0, "ir_weight": 1.0, "val_weight": 1.0}
+
+        ic_mod = regime_mod.get("ic_weight", 1.0)
+        ir_mod = regime_mod.get("ir_weight", 1.0)
+        val_mod = regime_mod.get("val_weight", 1.0)
+
+        w_train_ic = default_weights["train_ic"] * ic_mod
+        w_train_ir = default_weights["train_ir"] * ir_mod
+        w_train_wr = default_weights["train_wr"]
+        w_val_ic   = default_weights["val_ic"] * val_mod
+        w_val_ir   = default_weights["val_ir"] * val_mod
+
+        # 归一化权重
+        total_w = w_train_ic + w_train_ir + w_train_wr + w_val_ic + w_val_ir
+        if total_w > 0:
+            w_train_ic /= total_w
+            w_train_ir /= total_w
+            w_train_wr /= total_w
+            w_val_ic   /= total_w
+            w_val_ir   /= total_w
+
         base_score = (
-            0.20 * min(t_ic / 0.1, 1.0)
-            + 0.25 * min(t_ir / 2.0, 1.0)
-            + 0.10 * t_wr
-            + 0.25 * min(v_ic / 0.1, 1.0)
-            + 0.20 * min(v_ir / 2.0, 1.0)
+            w_train_ic * self._score_ic(t_ic)
+            + w_train_ir * self._score_ir(t_ir)
+            + w_train_wr * t_wr
+            + w_val_ic * self._score_ic(v_ic)
+            + w_val_ir * self._score_ir(v_ir)
         )
 
-        # auto-flip后训练集IC应为正，若验证集为负则说明过拟合
+        # 方向惩罚
         direction_penalty = 0.0
         if t_ic > 0.01 and v_ic > 0.005:
             if (t_ic_raw > 0) != (v_ic_raw > 0):
                 direction_penalty = 0.3 * min(t_ic / 0.1, 1.0)
 
-        score = base_score - direction_penalty
+        # P0-1: 同质化惩罚
+        similarity_penalty = 0.0
+        if code_similarity > 0.65:
+            # 相似度 0.65~1.0 映射到惩罚 0~0.25
+            similarity_penalty = (code_similarity - 0.65) / 0.35 * 0.25
+
+        score = base_score - direction_penalty - similarity_penalty
 
         return float(min(max(score, 0), 1))
+
+    @staticmethod
+    def _calc_worst_quarter_ic(ic_series: "pd.Series") -> float:
+        """计算最差季度的平均 IC"""
+        try:
+            quarterly = ic_series.resample("QE").mean()
+            if len(quarterly) < 2:
+                return float(ic_series.mean())
+            return float(quarterly.min())
+        except Exception:
+            return 0.0
+
+    @staticmethod
+    def _calc_quarterly_ic_breakdown(ic_series: "pd.Series") -> Dict[str, float]:
+        """按季度计算IC均值分布，返回 {quarter_label: ic_mean}"""
+        try:
+            if len(ic_series) < 5:
+                return {}
+            quarterly = ic_series.resample("QE").mean().dropna()
+            return {f"{k.year}-Q{(k.month-1)//3+1}": float(v)
+                    for k, v in quarterly.items()}
+        except Exception:
+            return {}
+
+    def _calc_monotonicity(
+        self, factor_panel: "pd.DataFrame", returns: "pd.DataFrame"
+    ) -> float:
+        """
+        计算因子分组收益的单调性（Spearman rank correlation of group returns）
+
+        将股票按因子值分5组，计算各组平均收益，检查收益是否单调递增。
+        返回 0~1 之间的分数，1.0 表示完美单调。
+        """
+        try:
+            common_dates = factor_panel.index.intersection(returns.index)
+            if len(common_dates) < 20:
+                return 0.5
+
+            mono_scores = []
+            for date in common_dates[-60:]:
+                fv = factor_panel.loc[date].dropna()
+                rv = returns.loc[date].dropna()
+                common = fv.index.intersection(rv.index)
+                if len(common) < 50:
+                    continue
+
+                fv_c = fv[common]
+                rv_c = rv[common]
+
+                # 分5组
+                try:
+                    groups = pd.qcut(fv_c, 5, labels=False, duplicates="drop")
+                except Exception:
+                    continue
+
+                group_returns = rv_c.groupby(groups).mean()
+                if len(group_returns) < 4:
+                    continue
+
+                # Spearman correlation between group rank and group return
+                from scipy.stats import spearmanr
+                corr, _ = spearmanr(range(len(group_returns)), group_returns.values)
+                mono_scores.append(abs(corr))
+
+            if not mono_scores:
+                return 0.5
+            return float(np.mean(mono_scores))
+        except Exception:
+            return 0.5
 
     def _calc_factor_turnover(self, factor_panel: pd.DataFrame) -> float:
         """计算因子换手率（截面排名变化率的均值）"""
@@ -671,6 +990,170 @@ class CrossSectionalICEvaluator:
             return float(turnover) if not np.isnan(turnover) else 0.5
         except Exception:
             return 0.5
+
+    # ═══ Issue-7: 因子经济学逻辑验证 ═══
+
+    def _calc_size_group_ic_stability(
+        self, factor_panel: pd.DataFrame, returns: pd.DataFrame, n_groups: int = 3
+    ) -> float:
+        """
+        按市值分组计算 IC，返回跨组 IC 的稳定性（1 - 变异系数）。
+        稳定性高说明因子不依赖特定市值区间，泛化能力强。
+        返回 0~1，1 表示各组 IC 完全一致。
+        """
+        try:
+            mv_panel = pd.DataFrame(
+                {code: df["total_mv"] for code, df in self.stock_data.items() if "total_mv" in df.columns}
+            ).sort_index()
+
+            common_dates = factor_panel.index.intersection(returns.index).intersection(mv_panel.index)
+            common_stocks = factor_panel.columns.intersection(returns.columns).intersection(mv_panel.columns)
+            if len(common_dates) < 30 or len(common_stocks) < 50:
+                return 0.5
+
+            fp = factor_panel.loc[common_dates, common_stocks]
+            rp = returns.loc[common_dates, common_stocks]
+            mp = mv_panel.loc[common_dates, common_stocks]
+
+            group_ics = {g: [] for g in range(n_groups)}
+
+            sampled_dates = common_dates[::5]
+            for date in sampled_dates:
+                mv_row = mp.loc[date].dropna()
+                f_row = fp.loc[date].dropna()
+                r_row = rp.loc[date].dropna()
+                valid = mv_row.index.intersection(f_row.index).intersection(r_row.index)
+                if len(valid) < 60:
+                    continue
+
+                try:
+                    mv_groups = pd.qcut(mv_row[valid], n_groups, labels=False, duplicates="drop")
+                except Exception:
+                    continue
+
+                for g in range(n_groups):
+                    stocks_in_g = mv_groups[mv_groups == g].index
+                    if len(stocks_in_g) < 15:
+                        continue
+                    corr, _ = stats.spearmanr(f_row[stocks_in_g].values, r_row[stocks_in_g].values)
+                    if not np.isnan(corr):
+                        group_ics[g].append(corr)
+
+            mean_ics = [np.mean(v) for v in group_ics.values() if len(v) > 5]
+            if len(mean_ics) < 2:
+                return 0.5
+
+            ic_std = np.std(mean_ics)
+            ic_mean = np.mean(np.abs(mean_ics))
+            if ic_mean < 0.001:
+                return 0.5
+
+            cv = ic_std / ic_mean
+            stability = max(0.0, min(1.0, 1.0 - cv))
+            return float(stability)
+        except Exception:
+            return 0.5
+
+    def _calc_incremental_alpha(
+        self, factor_panel: pd.DataFrame, returns: pd.DataFrame
+    ) -> float:
+        """
+        增量 alpha 检验：回归掉 市值因子 + BP因子 后的残差 IC。
+        衡量因子提供的独立预测能力。
+        返回残差 IC 均值（越高说明增量 alpha 越强）。
+        """
+        try:
+            mv_panel = pd.DataFrame(
+                {code: np.log(df["total_mv"]) for code, df in self.stock_data.items() if "total_mv" in df.columns}
+            ).sort_index()
+            bp_panel = pd.DataFrame(
+                {code: 1.0 / df["pb"].replace(0, np.nan) for code, df in self.stock_data.items() if "pb" in df.columns}
+            ).sort_index()
+
+            common_dates = (factor_panel.index
+                           .intersection(returns.index)
+                           .intersection(mv_panel.index)
+                           .intersection(bp_panel.index))
+            common_stocks = (factor_panel.columns
+                            .intersection(returns.columns)
+                            .intersection(mv_panel.columns)
+                            .intersection(bp_panel.columns))
+
+            if len(common_dates) < 30 or len(common_stocks) < 50:
+                return 0.0
+
+            fp = factor_panel.loc[common_dates, common_stocks]
+            rp = returns.loc[common_dates, common_stocks]
+            mp = mv_panel.loc[common_dates, common_stocks]
+            bp = bp_panel.loc[common_dates, common_stocks]
+
+            residual_ics = []
+            sampled_dates = common_dates[::5]
+
+            for date in sampled_dates:
+                f_row = fp.loc[date].dropna()
+                r_row = rp.loc[date].dropna()
+                mv_row = mp.loc[date].dropna()
+                bp_row = bp.loc[date].dropna()
+
+                valid = f_row.index.intersection(r_row.index).intersection(mv_row.index).intersection(bp_row.index)
+                if len(valid) < 50:
+                    continue
+
+                y = f_row[valid].values
+                X = np.column_stack([mv_row[valid].values, bp_row[valid].values])
+
+                # 标准化
+                X_mean = X.mean(axis=0)
+                X_std = X.std(axis=0)
+                X_std[X_std == 0] = 1
+                X = (X - X_mean) / X_std
+
+                # OLS 回归取残差
+                X_aug = np.column_stack([np.ones(len(valid)), X])
+                try:
+                    beta = np.linalg.lstsq(X_aug, y, rcond=None)[0]
+                    residual = y - X_aug @ beta
+                except Exception:
+                    continue
+
+                # 残差与收益的 rank IC
+                corr, _ = stats.spearmanr(residual, r_row[valid].values)
+                if not np.isnan(corr):
+                    residual_ics.append(corr)
+
+            if not residual_ics:
+                return 0.0
+            return float(np.mean(residual_ics))
+        except Exception:
+            return 0.0
+
+    @staticmethod
+    def _calc_factor_type_code(code: str) -> float:
+        """
+        将因子类型映射为连续值，用于 MAP-Elites 多样性维度。
+        混合类型返回加权均值。
+        """
+        code_lower = code.lower()
+        categories = {
+            0.1: ["1/pb", "1/pe", "pe_ttm", "pb", "ps_ttm", "dv_ratio", "ep"],
+            0.3: ["pct_change", "pct_chg", "returns_", "momentum", "roc"],
+            0.5: ["std()", "volatility", "rolling(", ".std(", "amplitude"],
+            0.7: ["turnover", "amount", "volume", "vol_ratio", "vol_ma"],
+            0.9: ["macd", "rsi", "kdj", "boll", "bb_upper", "ema"],
+        }
+
+        weights = {}
+        for val, keywords in categories.items():
+            count = sum(1 for kw in keywords if kw in code_lower)
+            if count > 0:
+                weights[val] = count
+
+        if not weights:
+            return 0.5
+
+        total = sum(weights.values())
+        return sum(v * c for v, c in weights.items()) / total
 
     @staticmethod
     def _empty_result(error: str) -> Dict[str, Any]:
@@ -686,6 +1169,7 @@ class CrossSectionalICEvaluator:
             "ic_ir": 0.0,
             "ic_stability": 0.0,
             "factor_turnover": 0.5,
+            "factor_type_code": 0.5,
             "_error": error,
         }
 

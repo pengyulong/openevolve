@@ -44,6 +44,9 @@ class KnowledgeRetriever:
         self.top_k = top_k
         self.rule_filter_min_candidates = rule_filter_min_candidates
 
+        # 记录最近一次检索召回的条目ID，用于后续反馈
+        self._last_retrieved_ids: List[str] = []
+
     def retrieve(
         self,
         program_metrics: Dict[str, Any],
@@ -103,7 +106,12 @@ class KnowledgeRetriever:
         if len(candidate_embeddings) == 0:
             # 没有嵌入向量缓存，只用规则过滤结果
             logger.debug("No embeddings available, returning rule-filtered results")
-            return candidates[: self.top_k]
+            results = candidates[: self.top_k]
+            self._last_retrieved_ids = [r["id"] for r in results]
+            self.kb.record_retrieval(self._last_retrieved_ids)
+            for entry_id in self._last_retrieved_ids:
+                self.kb.update_usage(entry_id)
+            return results
 
         # 生成查询嵌入
         query_embedding = self.embedder.embed_text(query_text)
@@ -111,8 +119,15 @@ class KnowledgeRetriever:
         # 计算余弦相似度
         similarities = self._cosine_similarity(query_embedding, candidate_embeddings)
 
-        # 按相似度排序
-        ranked_indices = np.argsort(similarities)[::-1]
+        # 获取 quality_score 用于加权排序
+        quality_scores = self.kb.get_quality_scores(valid_ids)
+        quality_array = np.array([quality_scores.get(eid, 0.5) for eid in valid_ids])
+
+        # 综合排序：similarity * 0.7 + quality_score * 0.3
+        final_scores = similarities * 0.7 + quality_array * 0.3
+
+        # 按综合分排序
+        ranked_indices = np.argsort(final_scores)[::-1]
         top_indices = ranked_indices[: self.top_k]
 
         # 获取结果
@@ -122,6 +137,10 @@ class KnowledgeRetriever:
         # 更新使用计数
         for entry_id in top_ids:
             self.kb.update_usage(entry_id)
+
+        # 记录检索召回（用于知识修剪追踪）
+        self._last_retrieved_ids = top_ids
+        self.kb.record_retrieval(top_ids)
 
         logger.info(
             f"Retrieved {len(results)} knowledge entries "
@@ -172,6 +191,24 @@ class KnowledgeRetriever:
             lines.append("")
 
         return "\n".join(lines)
+
+    def feedback(self, improved: bool, improvement_ratio: float = 0.0):
+        """
+        对最近一次检索召回的知识条目提供改进反馈
+
+        在演化迭代完成后调用此方法，告知知识库哪些知识条目
+        实际带来了改进（或没有）。用于知识修剪追踪。
+
+        Args:
+            improved: 子代因子是否有改进
+            improvement_ratio: 改进幅度（combined_score相对提升比例）
+        """
+        if self._last_retrieved_ids:
+            self.kb.record_feedback(self._last_retrieved_ids, improved, improvement_ratio)
+
+    def get_last_retrieved_ids(self) -> List[str]:
+        """返回最近一次检索召回的条目ID列表"""
+        return self._last_retrieved_ids
 
     def _extract_problem_codes(self, metrics: Dict[str, Any]) -> List[str]:
         """从评估指标中提取问题类型码"""

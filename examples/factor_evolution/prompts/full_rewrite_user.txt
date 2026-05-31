@@ -28,11 +28,17 @@
 
 {knowledge_base_context}
 
-## 优秀因子示例与演化历史
+## 竞争态势与进化目标
+
+{competition_context}
+
+## 优秀因子代码参考
 
 {evolution_history}
 
 ## 改进指南
+
+{island_hint}
 
 ### 核心目标
 - **正IC > 0.08**：截面 Rank IC 均值

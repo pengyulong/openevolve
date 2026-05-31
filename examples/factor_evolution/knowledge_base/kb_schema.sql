@@ -44,13 +44,19 @@ CREATE TABLE IF NOT EXISTS knowledge_analytics (
     total_retrievals INTEGER DEFAULT 0,     -- 总检索次数
     total_applications INTEGER DEFAULT 0,   -- 被应用到prompt的次数
     application_successes INTEGER DEFAULT 0,-- 应用后带来改进的次数
+    consecutive_failures INTEGER DEFAULT 0, -- 连续被召回但无增益的次数（核心修剪指标）
     avg_improvement REAL DEFAULT 0.0,       -- 平均改进幅度
+    last_retrieved_at TEXT DEFAULT '',      -- 最近被检索时间
+    last_improvement_at TEXT DEFAULT '',    -- 最近带来改进的时间
     last_evaluated_at TEXT DEFAULT '',
     quality_score REAL DEFAULT 0.5,         -- 综合质量评分
     needs_revision BOOLEAN DEFAULT 0,       -- 是否需要修正
     revision_notes TEXT DEFAULT '',         -- 修正备注
     FOREIGN KEY (entry_id) REFERENCES knowledge_entries(id)
 );
+
+-- 迁移：为 knowledge_analytics 添加修剪支持字段（如果表已存在但缺少这些列）
+-- SQLite 不支持 IF NOT EXISTS for ALTER TABLE，迁移逻辑在 kb_manager._migrate_schema() 中处理
 
 -- 知识回写队列（待LLM总结的候选知识）
 CREATE TABLE IF NOT EXISTS writeback_queue (

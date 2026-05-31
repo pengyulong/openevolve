@@ -6,6 +6,7 @@ output/
 output_v1/
 output_v2_run1/
 output_v2_run2/
+output_baseline_v1/
 
 # 数据缓存（运行时自动下载）
 data_cache/*.parquet

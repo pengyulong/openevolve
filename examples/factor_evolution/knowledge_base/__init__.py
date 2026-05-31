@@ -12,5 +12,6 @@ from .kb_manager import KnowledgeBase
 from .kb_embedder import KBEmbedder
 from .kb_retriever import KnowledgeRetriever
 from .kb_writer import KnowledgeWriter
+from .kb_expert import ExpertAdvisor
 
-__all__ = ["KnowledgeBase", "KBEmbedder", "KnowledgeRetriever", "KnowledgeWriter"]
+__all__ = ["KnowledgeBase", "KBEmbedder", "KnowledgeRetriever", "KnowledgeWriter", "ExpertAdvisor"]

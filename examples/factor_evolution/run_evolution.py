@@ -17,6 +17,9 @@ import argparse
 # 添加项目根目录到路径
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
 
+from dotenv import load_dotenv, find_dotenv
+load_dotenv(find_dotenv(usecwd=True))
+
 from openevolve import run_evolution
 
 
